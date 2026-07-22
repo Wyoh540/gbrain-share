@@ -597,7 +597,15 @@ export class PostgresEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema = current_schema() AND table_name = 'timeline_entries') AS timeline_entries_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema = current_schema() AND table_name = 'timeline_entries' AND column_name = 'event_page_id') AS timeline_event_page_id_exists
+                WHERE table_schema = current_schema() AND table_name = 'timeline_entries' AND column_name = 'event_page_id') AS timeline_event_page_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'oauth_tokens') AS oauth_tokens_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'oauth_tokens' AND column_name = 'user_id') AS oauth_tokens_user_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'oauth_codes' AND column_name = 'user_id') AS oauth_codes_user_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'mcp_request_log' AND column_name = 'username') AS mcp_log_username_exists
     `;
     const probe = probeRows[0]!;
 
@@ -698,6 +706,22 @@ export class PostgresEngine implements BrainEngine {
     // v121: schema-blob indexes reference event_page_id before migrations run.
     const needsTimelineEventPageId = probeCr.timeline_entries_exists === true
       && !probeCr.timeline_event_page_id_exists;
+    // v125 (multi_user_auth_tables): idx_oauth_tokens_user in SCHEMA_SQL
+    // references oauth_tokens.user_id; pre-v125 brains crash without the
+    // column. oauth_codes.user_id has no index today — defense-in-depth.
+    // FK constraints land via the v125 migration's DO-block, so bootstrap
+    // adds plain columns only.
+    const probeV125 = probe as {
+      oauth_tokens_exists?: boolean;
+      oauth_tokens_user_id_exists?: boolean;
+      oauth_codes_user_id_exists?: boolean;
+      mcp_log_username_exists?: boolean;
+    };
+    const needsOauthUserIdColumns = probeV125.oauth_tokens_exists === true
+      && (!probeV125.oauth_tokens_user_id_exists || !probeV125.oauth_codes_user_id_exists);
+    // v125: mcp_request_log.username attribution column. No index references
+    // it; defense-in-depth so pre-v125 brains don't drift.
+    const needsMcpLogUsername = probe.mcp_log_exists && !probeV125.mcp_log_username_exists;
 
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsMcpLogBootstrap && !needsSubagentProviderId
@@ -709,7 +733,9 @@ export class PostgresEngine implements BrainEngine {
         && !needsContextualRetrievalColumns && !needsPagesGeneration
         && !needsPagesEmbeddingSignature
         && !needsPagesLinksExtractedAt
-        && !needsTimelineEventPageId) return;
+        && !needsTimelineEventPageId
+        && !needsOauthUserIdColumns
+        && !needsMcpLogUsername) return;
 
     process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
@@ -962,6 +988,26 @@ export class PostgresEngine implements BrainEngine {
       // source of truth for the FK and indexes and runs idempotently afterward.
       await conn.unsafe(`
         ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS event_page_id INTEGER;
+      `);
+    }
+
+    if (needsOauthUserIdColumns) {
+      // v125 (multi_user_auth_tables): plain columns only — the FK
+      // constraints on user_id land via the v125 migration's guarded
+      // ADD CONSTRAINT DO-block (bootstrap-created columns must not skip
+      // the FK). idx_oauth_tokens_user in SCHEMA_SQL crashes without
+      // oauth_tokens.user_id.
+      await conn.unsafe(`
+        ALTER TABLE oauth_tokens ADD COLUMN IF NOT EXISTS user_id TEXT;
+        ALTER TABLE oauth_codes ADD COLUMN IF NOT EXISTS user_id TEXT;
+      `);
+    }
+
+    if (needsMcpLogUsername) {
+      // v125: mcp_request_log.username attribution column. v125 migration
+      // runs later via runMigrations and is idempotent.
+      await conn.unsafe(`
+        ALTER TABLE mcp_request_log ADD COLUMN IF NOT EXISTS username TEXT;
       `);
     }
   }

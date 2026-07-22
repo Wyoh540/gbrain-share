@@ -5671,6 +5671,89 @@ export const MIGRATIONS: Migration[] = [
 `);
     },
   },
+  {
+    version: 125,
+    name: 'multi_user_auth_tables',
+    // Multi-user auth: first-class human users + role-based per-source
+    // permissions. users.is_admin gates user/role MANAGEMENT only (orthogonal
+    // to source access; admins read content via roles like everyone else).
+    // oauth_pending_logins backs the browser login page on /authorize
+    // (10-min TTL, swept by sweepExpiredTokens; attempts caps brute force).
+    // oauth_codes.user_id / oauth_tokens.user_id bind the authorization-code
+    // flow to a user; NULL = machine client (client_credentials / legacy),
+    // behavior unchanged. mcp_request_log.username attributes human calls.
+    //
+    // FK constraints on the two user_id columns land via DO-block guarded
+    // ADD CONSTRAINT (not inline in ADD COLUMN) so brains whose forward-
+    // reference bootstrap pre-added plain user_id columns still pick up the
+    // FK (ADD COLUMN IF NOT EXISTS would no-op and skip it otherwise).
+    // Keep in sync with src/schema.sql, src/core/pglite-schema.ts, and the
+    // generated src/core/schema-embedded.ts.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS users (
+        id            TEXT PRIMARY KEY,
+        username      TEXT NOT NULL UNIQUE,
+        display_name  TEXT,
+        email         TEXT,
+        password_hash TEXT NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'active',
+        is_admin      BOOLEAN NOT NULL DEFAULT false,
+        must_reset_password BOOLEAN NOT NULL DEFAULT false,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS roles (
+        id          TEXT PRIMARY KEY,
+        description TEXT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS role_source_permissions (
+        role_id   TEXT NOT NULL REFERENCES roles(id)   ON DELETE CASCADE,
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        access    TEXT NOT NULL CHECK (access IN ('read','write')),
+        PRIMARY KEY (role_id, source_id)
+      );
+      CREATE TABLE IF NOT EXISTS user_roles (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+        PRIMARY KEY (user_id, role_id)
+      );
+      CREATE TABLE IF NOT EXISTS oauth_pending_logins (
+        nonce      TEXT PRIMARY KEY,
+        client_id  TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+        params     JSONB NOT NULL,
+        attempts   INTEGER NOT NULL DEFAULT 0,
+        expires_at BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      ALTER TABLE oauth_codes  ADD COLUMN IF NOT EXISTS user_id TEXT;
+      ALTER TABLE oauth_tokens ADD COLUMN IF NOT EXISTS user_id TEXT;
+      CREATE INDEX IF NOT EXISTS idx_oauth_tokens_user ON oauth_tokens(user_id);
+      ALTER TABLE mcp_request_log ADD COLUMN IF NOT EXISTS username TEXT;
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'oauth_codes_user_id_fkey'
+             AND conrelid = 'oauth_codes'::regclass
+        ) THEN
+          ALTER TABLE oauth_codes
+            ADD CONSTRAINT oauth_codes_user_id_fkey
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'oauth_tokens_user_id_fkey'
+             AND conrelid = 'oauth_tokens'::regclass
+        ) THEN
+          ALTER TABLE oauth_tokens
+            ADD CONSTRAINT oauth_tokens_user_id_fkey
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+      END $$;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

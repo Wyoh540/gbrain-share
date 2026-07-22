@@ -637,7 +637,48 @@ CREATE TABLE IF NOT EXISTS mcp_request_log (
   status        TEXT NOT NULL DEFAULT 'success',
   params        JSONB,
   error_message TEXT,
+  username      TEXT,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- Multi-user auth (migration v125): human users + role-based
+-- per-source permissions. users.is_admin gates user/role
+-- MANAGEMENT only — source access comes from roles for everyone,
+-- admins included. oauth_codes.user_id / oauth_tokens.user_id
+-- (inline below) bind the authorization-code flow to a user;
+-- NULL = machine client, behavior unchanged.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS users (
+  id            TEXT PRIMARY KEY,
+  username      TEXT NOT NULL UNIQUE,
+  display_name  TEXT,
+  email         TEXT,
+  password_hash TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'active',
+  is_admin      BOOLEAN NOT NULL DEFAULT false,
+  must_reset_password BOOLEAN NOT NULL DEFAULT false,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS roles (
+  id          TEXT PRIMARY KEY,
+  description TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS role_source_permissions (
+  role_id   TEXT NOT NULL REFERENCES roles(id)   ON DELETE CASCADE,
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  access    TEXT NOT NULL CHECK (access IN ('read','write')),
+  PRIMARY KEY (role_id, source_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_roles (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+  PRIMARY KEY (user_id, role_id)
 );
 
 -- ============================================================
@@ -678,6 +719,7 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
   token_hash   TEXT PRIMARY KEY,
   token_type   TEXT NOT NULL,
   client_id    TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+  user_id      TEXT REFERENCES users(id) ON DELETE CASCADE,
   scopes       TEXT[],
   expires_at   BIGINT,
   resource     TEXT,
@@ -686,10 +728,12 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_oauth_tokens_expiry ON oauth_tokens(expires_at);
 CREATE INDEX IF NOT EXISTS idx_oauth_tokens_client ON oauth_tokens(client_id);
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_user ON oauth_tokens(user_id);
 
 CREATE TABLE IF NOT EXISTS oauth_codes (
   code_hash              TEXT PRIMARY KEY,
   client_id              TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+  user_id                TEXT REFERENCES users(id) ON DELETE CASCADE,
   scopes                 TEXT[],
   code_challenge         TEXT NOT NULL,
   code_challenge_method  TEXT NOT NULL DEFAULT 'S256',
@@ -698,6 +742,17 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
   resource               TEXT,
   expires_at             BIGINT NOT NULL,
   created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Pending browser logins for the /authorize password flow (10-min TTL,
+-- swept by sweepExpiredTokens; attempts caps online brute force at 5).
+CREATE TABLE IF NOT EXISTS oauth_pending_logins (
+  nonce      TEXT PRIMARY KEY,
+  client_id  TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+  params     JSONB NOT NULL,
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  expires_at BIGINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Composite indexes for admin dashboard request log queries
@@ -1440,6 +1495,12 @@ BEGIN
     ALTER TABLE oauth_clients ENABLE ROW LEVEL SECURITY;
     ALTER TABLE oauth_tokens ENABLE ROW LEVEL SECURITY;
     ALTER TABLE oauth_codes ENABLE ROW LEVEL SECURITY;
+    -- Multi-user auth tables (v125)
+    ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE roles ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE role_source_permissions ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE user_roles ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE oauth_pending_logins ENABLE ROW LEVEL SECURITY;
     RAISE NOTICE 'RLS enabled on all tables (role % has BYPASSRLS)', current_user;
   ELSE
     RAISE WARNING 'Skipping RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;

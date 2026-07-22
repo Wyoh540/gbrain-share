@@ -171,6 +171,12 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // v121 — referenced by the timeline event lookup and dedup indexes before
   // the numbered migration can add the column on an existing brain.
   { kind: 'column', table: 'timeline_entries', column: 'event_page_id' },
+  // v125 (multi_user_auth_tables) — idx_oauth_tokens_user ON
+  // oauth_tokens(user_id) forward-references the column. oauth_codes.user_id
+  // and mcp_request_log.username are same-wave columns, defense-in-depth.
+  { kind: 'column', table: 'oauth_tokens', column: 'user_id' },
+  { kind: 'column', table: 'oauth_codes', column: 'user_id' },
+  { kind: 'column', table: 'mcp_request_log', column: 'username' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
@@ -243,6 +249,13 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       DROP INDEX IF EXISTS idx_oauth_clients_federated_read;
       ALTER TABLE oauth_clients DROP COLUMN IF EXISTS source_id;
       ALTER TABLE oauth_clients DROP COLUMN IF EXISTS federated_read;
+
+      -- v125 multi-user auth columns: give applyForwardReferenceBootstrap
+      -- work to do (idx_oauth_tokens_user forward-references user_id).
+      DROP INDEX IF EXISTS idx_oauth_tokens_user;
+      ALTER TABLE oauth_tokens DROP COLUMN IF EXISTS user_id;
+      ALTER TABLE oauth_codes DROP COLUMN IF EXISTS user_id;
+      ALTER TABLE mcp_request_log DROP COLUMN IF EXISTS username;
 
       -- v0.40.3.0 v90 + v91 column strips so applyForwardReferenceBootstrap
       -- has work to do. Only strip pages columns + the trigger; sources
@@ -328,6 +341,11 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       ALTER TABLE pages DROP COLUMN IF EXISTS import_filename;
       ALTER TABLE pages DROP COLUMN IF EXISTS salience_touched_at;
       ALTER TABLE pages DROP COLUMN IF EXISTS emotional_weight;
+
+      -- v125: idx_oauth_tokens_user forward-references oauth_tokens.user_id;
+      -- without the bootstrap the blob replay below would crash here.
+      DROP INDEX IF EXISTS idx_oauth_tokens_user;
+      ALTER TABLE oauth_tokens DROP COLUMN IF EXISTS user_id;
     `);
 
     // Bootstrap, then schema replay. Either step crashing fails the test.
