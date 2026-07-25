@@ -305,6 +305,17 @@ export interface AuthInfo {
    * case (back-compat).
    */
   allowedSources?: string[];
+  /** Human user id (multi-user auth). Absent = machine client / legacy token. */
+  userId?: string;
+  /** Login name of the human user, for audit + request-log attribution. */
+  username?: string;
+  /**
+   * Union of source ids the user may WRITE (from roles). For machine clients
+   * this is `[sourceId]`. Empty array = read-only subject. Fail-closed:
+   * undefined is treated as `[sourceId ?? 'default']` by resolveWriteScope
+   * for pre-multi-user rows.
+   */
+  writeSources?: string[];
 }
 
 export interface OperationContext {
@@ -537,6 +548,35 @@ export function resolveRequestedScope(
     return { sourceId: sourceIdParam };
   }
   return sourceScopeOpts(ctx);
+}
+
+/**
+ * Resolve the source a WRITE op targets. Fail-closed choke point for all
+ * write-side ops (put_page, capture, …). Precedence + rules:
+ *   requested ∈ writeSources → requested
+ *   no requested + exactly 1 writeSource → it
+ *   no requested + 0 writeSources → throw (read-only subject)
+ *   no requested + >1 writeSources → throw (must specify explicitly)
+ *   requested ∉ writeSources → throw, error lists the granted set
+ * Machine clients get writeSources=[sourceId] → behavior identical to the
+ * pre-multi-user scalar model.
+ */
+export function resolveWriteScope(ctx: OperationContext, requested: string | undefined): string {
+  // Local CLI bypass: single-user local installs are untouched.
+  if (ctx.remote === false) {
+    return requested ?? ctx.sourceId ?? 'default';
+  }
+  const auth = ctx.auth;
+  const writeSources = auth?.writeSources ?? (auth?.sourceId ? [auth.sourceId] : [ctx.sourceId ?? 'default']);
+  if (requested !== undefined) {
+    if (!writeSources.includes(requested)) {
+      throw new Error(`Source "${requested}" not granted write. Writable: [${writeSources.join(', ') || '(none)'}]`);
+    }
+    return requested;
+  }
+  if (writeSources.length === 1) return writeSources[0];
+  if (writeSources.length === 0) throw new Error('Read-only subject: no write sources granted');
+  throw new Error(`Multiple write sources granted [${writeSources.join(', ')}]; specify --source explicitly`);
 }
 
 /**
@@ -814,6 +854,13 @@ const put_page: Operation = {
       provenanceKind = 'mcp:put_page';
       provenanceUri = null;
       provenanceVia = 'mcp:put_page';
+    }
+
+    // Multi-user auth write-scope resolution (Task 4). Fail-closed: only
+    // remote authenticated callers are gated; local CLI keeps existing
+    // single-user behavior untouched.
+    if (ctx.remote !== false && ctx.auth) {
+      ctx.sourceId = resolveWriteScope(ctx, undefined);
     }
 
     // Subagent namespace enforcement (v0.15+). Runs BEFORE the dry-run
