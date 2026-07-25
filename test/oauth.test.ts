@@ -41,6 +41,23 @@ afterAll(async () => {
 }, 15_000);
 
 // ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+// Multi-user auth: authorize() now renders an HTML login page. Tests that
+// need to issue codes directly call this wrapper around __testOnlyIssueCodeForUser.
+async function testIssueCode(clientId: string, params: {
+  codeChallenge?: string; redirectUri?: string; scopes?: string[]; state?: string; resource?: string;
+} = {}): Promise<string> {
+  return provider.__testOnlyIssueCodeForUser(clientId, {
+    codeChallenge: params.codeChallenge || 'test-challenge-hash',
+    redirectUri: params.redirectUri || 'http://localhost:3000/callback',
+    scopes: params.scopes || ['read', 'write'],
+    state: params.state || 'test-state',
+  });
+}
+
+// ---------------------------------------------------------------------------
 // hashToken + generateToken utilities
 // ---------------------------------------------------------------------------
 
@@ -411,25 +428,15 @@ describe('authorization code flow', () => {
     const client = (await provider.clientsStore.getClient(clientId))!;
 
     // Mock Express response for authorize
-    let redirectUrl = '';
-    const mockRes = {
-      redirect: (url: string) => { redirectUrl = url; },
-    } as any;
-
-    await provider.authorize(client, {
+        const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'test-challenge-hash',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read', 'write'],
       state: 'test-state',
-    }, mockRes);
+    }, );
 
-    expect(redirectUrl).toContain('code=gbrain_code_');
-    expect(redirectUrl).toContain('state=test-state');
-
-    // Extract code from redirect URL
-    const url = new URL(redirectUrl);
-    const code = url.searchParams.get('code')!;
-
+            // Extract code from redirect URL
+    const code = __code;
     // Exchange code for tokens
     const tokens = await provider.exchangeAuthorizationCode(client, code);
     expect(tokens.access_token).toStartWith('gbrain_at_');
@@ -443,17 +450,15 @@ describe('authorization code flow', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
 
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
+    }, );
 
-    const code = new URL(redirectUrl).searchParams.get('code')!;
-
+    const code = __code;
     // First exchange works
     await provider.exchangeAuthorizationCode(client, code);
 
@@ -492,17 +497,16 @@ describe('authorization code flow', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+
 
     // Read-only client requests admin via the SDK's parsed scopes array.
-    await provider.authorize(client, {
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read', 'write', 'admin'],
-    }, mockRes);
+    }, );
 
-    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const code = __code;
     const tokens = await provider.exchangeAuthorizationCode(client, code);
 
     // The token's stored scopes must equal the clamped subset.
@@ -519,16 +523,15 @@ describe('authorization code flow', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
 
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
+    }, );
 
-    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const code = __code;
     const tokens = await provider.exchangeAuthorizationCode(client, code);
     const auth = await provider.verifyAccessToken(tokens.access_token);
     expect(auth.scopes).toEqual(['read']);
@@ -546,15 +549,13 @@ describe('authorization code flow', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
-
+    }, );
+    const code = __code;
     const N = 10;
     const results = await Promise.allSettled(
       Array.from({ length: N }, () => provider.exchangeAuthorizationCode(client, code)),
@@ -578,16 +579,15 @@ describe('refresh token', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
 
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read', 'write'],
-    }, mockRes);
+    }, );
 
-    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const code = __code;
     const tokens = await provider.exchangeAuthorizationCode(client, code);
 
     // Refresh
@@ -610,14 +610,13 @@ describe('refresh token', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
+    }, );
+    const code = __code;
     const tokens = await provider.exchangeAuthorizationCode(client, code);
 
     const N = 10;
@@ -797,15 +796,12 @@ describe('F1/F4 cross-client isolation', () => {
     const owner = (await provider.clientsStore.getClient(ownerId))!;
     const attacker = (await provider.clientsStore.getClient(attackerId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(owner, {
+    const __code = await provider.__testOnlyIssueCodeForUser(owner.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
-
+    });
+    const code = __code;
     // Attacker holding the same code MUST be rejected.
     await expect(provider.exchangeAuthorizationCode(attacker, code)).rejects.toThrow();
 
@@ -828,17 +824,14 @@ describe('F1/F4 cross-client isolation', () => {
     const owner = (await provider.clientsStore.getClient(ownerId))!;
     const attacker = (await provider.clientsStore.getClient(attackerId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(owner, {
-      codeChallenge: 'owner-challenge',
+    const __code = await provider.__testOnlyIssueCodeForUser(owner.client_id!, {
+      codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
-
+    });
+    const code = __code;
     await expect(provider.challengeForAuthorizationCode!(attacker, code)).rejects.toThrow();
-    await expect(provider.challengeForAuthorizationCode!(owner, code)).resolves.toBe('owner-challenge');
+    await expect(provider.challengeForAuthorizationCode!(owner, code)).resolves.toBe('challenge');
   });
 
   test('wrong client cannot revoke another client token', async () => {
@@ -876,14 +869,12 @@ describe('F2/F3 refresh hardening', () => {
     const owner = (await provider.clientsStore.getClient(ownerId))!;
     const attacker = (await provider.clientsStore.getClient(attackerId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(owner, {
+    const __code = await provider.__testOnlyIssueCodeForUser(owner.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
+    });
+    const code = __code;
     const tokens = await provider.exchangeAuthorizationCode(owner, code);
 
     // Attacker rejected.
@@ -909,14 +900,13 @@ describe('F2/F3 refresh hardening', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
+    }, );
+    const code = __code;
     const tokens = await provider.exchangeAuthorizationCode(client, code);
 
     // Attempt to escalate to write — must reject.
@@ -936,14 +926,13 @@ describe('F2/F3 refresh hardening', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['admin'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
+    }, );
+    const code = __code;
     const tokens = await provider.exchangeAuthorizationCode(client, code);
 
     // Refresh requesting only sources_admin — admin implies it, so this
@@ -974,14 +963,13 @@ describe('F2/F3 refresh hardening', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['admin'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
+    }, );
+    const code = __code;
     const tokens = await provider.exchangeAuthorizationCode(client, code);
 
     const rotated = await provider.exchangeRefreshToken(
@@ -998,14 +986,13 @@ describe('F2/F3 refresh hardening', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['write'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
+    }, );
+    const code = __code;
     const tokens = await provider.exchangeAuthorizationCode(client, code);
 
     await expect(
@@ -1118,15 +1105,13 @@ describe('F7c redirect_uri binding on auth code exchange', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
-
+    }, );
+    const code = __code;
     const tokens = await provider.exchangeAuthorizationCode(
       client, code, undefined, 'http://localhost:3000/callback',
     );
@@ -1140,15 +1125,13 @@ describe('F7c redirect_uri binding on auth code exchange', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
-
+    }, );
+    const code = __code;
     // Attacker submitting the auth code with a different redirect_uri (e.g.,
     // an attacker-controlled callback URL) MUST be rejected. RFC 6749 §4.1.3.
     await expect(
@@ -1171,15 +1154,13 @@ describe('F7c redirect_uri binding on auth code exchange', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
-
+    }, );
+    const code = __code;
     await expect(
       provider.exchangeAuthorizationCode(client, code, undefined, ''),
     ).rejects.toThrow();
@@ -1196,15 +1177,13 @@ describe('F7c redirect_uri binding on auth code exchange', () => {
     );
     const client = (await provider.clientsStore.getClient(clientId))!;
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'challenge',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
-
+    }, );
+    const code = __code;
     const tokens = await provider.exchangeAuthorizationCode(client, code);
     expect(tokens.access_token).toStartWith('gbrain_at_');
   });
@@ -1325,14 +1304,13 @@ describe('PKCE DCR public-client gate (#909)', () => {
     const client = (await provider.clientsStore.getClient(reg.client_id))!;
     expect(client.client_secret).toBeUndefined();
 
-    let redirectUrl = '';
-    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
-    await provider.authorize(client, {
+
+    const __code = await provider.__testOnlyIssueCodeForUser(client.client_id!, {
       codeChallenge: 'test-challenge-value',
       redirectUri: 'http://localhost:3000/callback',
       scopes: ['read'],
-    }, mockRes);
-    const code = new URL(redirectUrl).searchParams.get('code')!;
+    }, );
+    const code = __code;
     expect(code).toMatch(/^gbrain_code_/);
 
     // Exchange the code — public client; no secret on the wire.

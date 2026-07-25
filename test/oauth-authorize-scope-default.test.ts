@@ -23,7 +23,7 @@ beforeAll(async () => {
   await engine.connect({});
   await engine.initSchema();
   sql = sqlQueryForEngine(engine);
-  provider = new GBrainOAuthProvider({ sql });
+  provider = new GBrainOAuthProvider({ sql, engine });
 });
 
 afterAll(async () => {
@@ -38,29 +38,30 @@ beforeEach(async () => {
 
 // authorize() writes the granted scope into oauth_codes then redirects; we
 // assert on the stored grant directly, so the redirect is a no-op.
-const noopRes = { redirect() {} } as any;
+const noopRes = { status() { return this; }, set() { return this; }, redirect() {}, send(_body: string) {} } as any;
 
 async function authorizeAndReadScopes(
   scope: string,
   requested: string[] | undefined,
 ): Promise<string[]> {
-  const reg = await provider.registerClientManual(
+  const { clientId } = await provider.registerClientManual(
     'authz-test', ['authorization_code'], scope, ['https://example.test/cb'],
   );
-  const client = await provider.clientsStore.getClient(reg.clientId);
+  const client = await provider.clientsStore.getClient(clientId);
   expect(client).toBeTruthy();
-  await provider.authorize(
-    client!,
+  // Multi-user auth: authorize() now renders HTML. Scope clamp moved to
+  // __testOnlyIssueCodeForUser — call it directly for assert-on-grant tests.
+  await provider.__testOnlyIssueCodeForUser(
+    client!.client_id!,
     {
       scopes: requested,
       codeChallenge: 'test-challenge',
       redirectUri: 'https://example.test/cb',
       state: 'xyz',
     } as any,
-    noopRes,
   );
   const rows = (await sql`
-    SELECT scopes FROM oauth_codes WHERE client_id = ${reg.clientId}
+    SELECT scopes FROM oauth_codes WHERE client_id = ${clientId}
   `) as Array<{ scopes: string[] }>;
   expect(rows.length).toBe(1);
   return rows[0].scopes ?? [];

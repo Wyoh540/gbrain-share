@@ -28,6 +28,8 @@ import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } fr
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope } from './legacy-token-scope.ts';
 import type { SqlQuery, SqlValue } from './sql-query.ts';
+import { executeRawJsonb } from './sql-query.ts';
+import type { BrainEngine } from './engine.ts';
 export type { SqlQuery, SqlValue };
 
 export interface AgentClientBindings {
@@ -178,6 +180,8 @@ export function coerceTimestamp(value: unknown): number | undefined {
 
 interface GBrainOAuthProviderOptions {
   sql: SqlQuery;
+  /** BrainEngine — needed for JSONB-safe writes (oauth_pending_logins.params). */
+  engine?: BrainEngine;
   /** Default token TTL in seconds (default: 3600 = 1 hour) */
   tokenTtl?: number;
   /** Default refresh token TTL in seconds (default: 30 days) */
@@ -380,6 +384,7 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
 
 export class GBrainOAuthProvider implements OAuthServerProvider {
   private sql: SqlQuery;
+  private engine?: BrainEngine;
   private _clientsStore: GBrainClientsStore;
   private readonly dcrDisabled: boolean;
   private tokenTtl: number;
@@ -387,6 +392,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
 
   constructor(options: GBrainOAuthProviderOptions) {
     this.sql = options.sql;
+    this.engine = options.engine;
     this._clientsStore = new GBrainClientsStore(this.sql, options.allowClientCredentialsDcr === true);
     this.dcrDisabled = options.dcrDisabled === true;
     this.tokenTtl = options.tokenTtl || 3600;
@@ -462,17 +468,153 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     return code;
   }
 
+  /**
+   * Render the browser login page. Creates a single-use pending-login row
+   * with a 10-min TTL and sends an HTML form for username+password login.
+   */
   async authorize(
     client: OAuthClientInformationFull,
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
-    const code = await this.__testOnlyIssueCodeForUser(client.client_id, params);
+    const nonce = generateToken('gbrain_pl_');
+    const expiresAt = Math.floor(Date.now() / 1000) + 600;
 
-    // Redirect back with the code
-    const redirectUrl = new URL(params.redirectUri);
+    // Use JSONB-safe path when engine is available; fall back to tagged
+    // template for test harnesses that pass object-accepting sql functions.
+    if (this.engine) {
+      await executeRawJsonb(
+        this.engine,
+        `INSERT INTO oauth_pending_logins (nonce, client_id, params, attempts, expires_at)
+         VALUES ($1, $2, $5::jsonb, $3, $4)`,
+        [nonce, client.client_id, 0, expiresAt],
+        [{ redirectUri: params.redirectUri, codeChallenge: params.codeChallenge,
+           state: params.state, scopes: params.scopes, resource: params.resource?.toString() }],
+      );
+    } else {
+      const paramsObj = {
+        redirectUri: params.redirectUri,
+        codeChallenge: params.codeChallenge,
+        state: params.state,
+        scopes: params.scopes,
+        resource: params.resource?.toString(),
+      };
+      await this.sql`
+        INSERT INTO oauth_pending_logins (nonce, client_id, params, attempts, expires_at)
+        VALUES (${nonce}, ${client.client_id}, ${paramsObj as any}, ${0}, ${expiresAt})
+      `;
+    }
+
+    const { renderLoginPage } = await import('./login-page.ts');
+    const html = renderLoginPage({
+      clientName: client.client_name,
+      scopes: params.scopes || [],
+      nonce,
+    });
+    res.status(200).set({
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'",
+    }).send(html);
+  }
+
+  /**
+   * Validate username+password against a pending browser login nonce.
+   * On success: issues an authorization code bound to the authenticated
+   * user and redirects the browser back to the client's redirect_uri.
+   *
+   * Fail-closed: wrong password increments an attempts counter on the
+   * pending-login row; after 5 failures the nonce is destroyed.
+   * `must_reset_password` users get a `password_reset_required` error
+   * so the route can render the reset page instead.
+   */
+  async completeLogin(
+    nonce: string,
+    username: string,
+    password: string,
+    res: Response,
+  ): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    const rows = await this.sql`
+      SELECT client_id, params, attempts FROM oauth_pending_logins
+      WHERE nonce = ${nonce} AND expires_at > ${now}
+    `;
+    if (rows.length === 0) throw new Error('Login session expired — restart the sign-in from your app.');
+
+    const row = rows[0];
+
+    const { verifyUserPassword } = await import('./users.ts');
+    const user = await verifyUserPassword(this.sql, username, password);
+
+    if (!user) {
+      const attempts = ((row.attempts as number) || 0) + 1;
+      if (attempts >= 5) {
+        await this.sql`DELETE FROM oauth_pending_logins WHERE nonce = ${nonce}`;
+        throw new Error('Too many login attempts');
+      }
+      await this.sql`UPDATE oauth_pending_logins SET attempts = ${attempts} WHERE nonce = ${nonce}`;
+      throw new Error('Invalid credentials');
+    }
+
+    if (user.mustResetPassword) {
+      // Keep the nonce alive so the reset flow can use it. The route maps
+      // this error to the reset-password page (which re-uses the same nonce).
+      throw Object.assign(new Error('password_reset_required'), { code: 'password_reset_required' });
+    }
+
+    await this.sql`DELETE FROM oauth_pending_logins WHERE nonce = ${nonce}`;
+
+    const code = await this.__testOnlyIssueCodeForUser(
+      row.client_id as string,
+      row.params as unknown as AuthorizationParams,
+      user.id,
+    );
+
+    const paramsObj = row.params as Record<string, unknown>;
+    const redirectUrl = new URL(paramsObj.redirectUri as string);
     redirectUrl.searchParams.set('code', code);
-    if (params.state) redirectUrl.searchParams.set('state', params.state);
+    if (paramsObj.state) redirectUrl.searchParams.set('state', paramsObj.state as string);
+    res.redirect(redirectUrl.toString());
+  }
+
+  /**
+   * Handle the password-reset step of the login flow. Verifies the old
+   * password, sets the new one (clearing must_reset_password), and issues
+   * the authorization code.
+   */
+  async completePasswordReset(
+    nonce: string,
+    username: string,
+    oldPassword: string,
+    newPassword: string,
+    res: Response,
+  ): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    const rows = await this.sql`
+      SELECT client_id, params FROM oauth_pending_logins
+      WHERE nonce = ${nonce} AND expires_at > ${now}
+    `;
+    if (rows.length === 0) throw new Error('Login session expired');
+
+    const row = rows[0];
+
+    const { verifyUserPassword, setUserPassword, getUserByUsername } = await import('./users.ts');
+    const user = await verifyUserPassword(this.sql, username, oldPassword);
+    if (!user) throw new Error('Invalid credentials');
+
+    await setUserPassword(this.sql, user.id, newPassword);
+
+    await this.sql`DELETE FROM oauth_pending_logins WHERE nonce = ${nonce}`;
+
+    const code = await this.__testOnlyIssueCodeForUser(
+      row.client_id as string,
+      row.params as unknown as AuthorizationParams,
+      user.id,
+    );
+
+    const paramsObj = row.params as Record<string, unknown>;
+    const redirectUrl = new URL(paramsObj.redirectUri as string);
+    redirectUrl.searchParams.set('code', code);
+    if (paramsObj.state) redirectUrl.searchParams.set('state', paramsObj.state as string);
     res.redirect(redirectUrl.toString());
   }
 

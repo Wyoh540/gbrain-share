@@ -28,6 +28,7 @@ import { operations, OperationError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
+import { RateLimiter } from '../mcp/rate-limit.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
@@ -512,6 +513,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // is not passed); cleaner shape for tests and future maintainers.
   const oauthProvider = new GBrainOAuthProvider({
     sql,
+    engine: engine as any, // multi-user auth: needed for JSONB-safe pending logins
     tokenTtl,
     dcrDisabled: !enableDcr,
     allowClientCredentialsDcr: enableDcrInsecure === true,
@@ -900,6 +902,58 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
     next();
   });
+
+  // ---------------------------------------------------------------------------
+  // Browser password login on /authorize (multi-user auth)
+  //
+  // Registered BEFORE authRouter so these routes take precedence over the
+  // MCP SDK's GET /authorize (which renders a consent/redirect flow).
+  // ---------------------------------------------------------------------------
+  app.post('/authorize/login',
+    express.urlencoded({ extended: false }),
+    async (req, res, _next) => {
+      const { nonce, username, password } = req.body as Record<string, string>;
+      if (!nonce || !username || !password) {
+        res.status(400).type('text/html').send('<p>Missing fields</p>');
+        return;
+      }
+      try {
+        await oauthProvider.completeLogin(nonce, username, password, res);
+      } catch (err: any) {
+        if (err?.code === 'password_reset_required') {
+          const { renderResetPasswordPage } = await import('../core/login-page.ts');
+          res.status(200).set({
+            'Content-Type': 'text/html; charset=utf-8',
+            'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'",
+          }).send(renderResetPasswordPage({ nonce, username, error: err.message }));
+          return;
+        }
+        const msg = String(err?.message || 'Login failed').replace(/</g, '&lt;');
+        res.status(400).type('text/html').send(
+          `<h1>Login failed</h1><p>${msg}</p>`
+        );
+      }
+    },
+  );
+
+  app.post('/authorize/reset-password',
+    express.urlencoded({ extended: false }),
+    async (req, res, _next) => {
+      const { nonce, username, password, newPassword } = req.body as Record<string, string>;
+      if (!nonce || !username || !password || !newPassword) {
+        res.status(400).type('text/html').send('<p>Missing fields</p>');
+        return;
+      }
+      try {
+        await oauthProvider.completePasswordReset(nonce, username, password, newPassword, res);
+      } catch (err: any) {
+        const msg = String(err?.message || 'Password reset failed').replace(/</g, '&lt;');
+        res.status(400).type('text/html').send(
+          `<h1>Password reset failed</h1><p>${msg}</p>`
+        );
+      }
+    },
+  );
 
   app.use(authRouter);
 
