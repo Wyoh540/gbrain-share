@@ -1355,6 +1355,8 @@ const delete_page: Operation = {
   handler: async (ctx, p) => {
     const slug = p.slug as string;
     if (ctx.dryRun) return { dry_run: true, action: 'soft_delete_page', slug };
+    // Multi-user auth: resolve write source for user tokens.
+    if (ctx.remote !== false && ctx.auth) ctx.sourceId = resolveWriteScope(ctx, undefined);
     // v0.31.8 (D7): thread ctx.sourceId so multi-source brains soft-delete the
     // intended row instead of always targeting (default, slug).
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
@@ -2207,6 +2209,8 @@ const add_timeline_entry: Operation = {
     // the dry-run short-circuit so preview calls surface the same rejection.
     enforceSubagentSlugFence(ctx, p.slug as string, 'add_timeline_entry');
     if (ctx.dryRun) return { dry_run: true, action: 'add_timeline_entry', slug: p.slug };
+    // Multi-user auth: resolve write source for user tokens.
+    if (ctx.remote !== false && ctx.auth) ctx.sourceId = resolveWriteScope(ctx, undefined);
     const date = p.date as string;
     // Reject anything that isn't a strict YYYY-MM-DD with year 1900-2199 and
     // a real calendar day. PG DATE accepts year 5874897 silently — that's a
