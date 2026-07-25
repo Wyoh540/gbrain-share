@@ -5406,6 +5406,182 @@ const chronicle_backfill: Operation = {
   cliHints: { name: 'chronicle-backfill' },
 };
 
+// ============================================================================
+// Multi-user auth — users_admin management ops (Task 7)
+//
+// All ops require `users_admin` scope. Handlers delegate to the store modules
+// (src/core/users.ts, src/core/roles.ts). JSON-safe return shapes.
+// ============================================================================
+
+const users_list: Operation = {
+  name: 'users_list',
+  description: 'List all users with their assigned role names.',
+  params: {},
+  scope: 'users_admin',
+  handler: async (ctx) => {
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const { listUsers } = await import('./users.ts');
+    return { users: await listUsers(sqlQueryForEngine(ctx.engine)) };
+  },
+  cliHints: { name: 'users_list' },
+};
+
+const user_create: Operation = {
+  name: 'user_create',
+  description: 'Create a human user with an initial password. The user must reset this password on first login.',
+  params: {
+    username: { type: 'string', required: true, description: 'Login name — lowercase, 2-64 chars [a-z0-9._-]' },
+    password: { type: 'string', required: true, description: 'Initial password — min 10 characters' },
+    display_name: { type: 'string', description: 'Human-readable display name' },
+    email: { type: 'string', description: 'Contact email' },
+    is_admin: { type: 'boolean', description: 'Admin flag (dashboard access, not source access)' },
+  },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const { createUser } = await import('./users.ts');
+    return await createUser(sqlQueryForEngine(ctx.engine), {
+      username: p.username as string,
+      password: p.password as string,
+      displayName: p.display_name as string | undefined,
+      email: p.email as string | undefined,
+      isAdmin: p.is_admin as boolean | undefined,
+    });
+  },
+  cliHints: { name: 'user_create', positional: ['username', 'password'] },
+};
+
+const user_set_password: Operation = {
+  name: 'user_set_password',
+  description: 'Set a new password for an existing user and clear must_reset_password.',
+  params: {
+    user_id: { type: 'string', required: true },
+    password: { type: 'string', required: true, description: 'New password — min 10 characters' },
+  },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const { setUserPassword } = await import('./users.ts');
+    await setUserPassword(sqlQueryForEngine(ctx.engine), p.user_id as string, p.password as string);
+    return { status: 'password_updated' };
+  },
+  cliHints: { name: 'user_set_password', positional: ['user_id', 'password'] },
+};
+
+const user_disable: Operation = {
+  name: 'user_disable',
+  description: 'Disable a user — immediately invalidates all their access tokens.',
+  params: { user_id: { type: 'string', required: true } },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const { disableUser } = await import('./users.ts');
+    await disableUser(sqlQueryForEngine(ctx.engine), p.user_id as string);
+    return { status: 'disabled' };
+  },
+  cliHints: { name: 'user_disable', positional: ['user_id'] },
+};
+
+const user_enable: Operation = {
+  name: 'user_enable',
+  description: 'Re-enable a previously disabled user.',
+  params: { user_id: { type: 'string', required: true } },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const { enableUser } = await import('./users.ts');
+    await enableUser(sqlQueryForEngine(ctx.engine), p.user_id as string);
+    return { status: 'enabled' };
+  },
+  cliHints: { name: 'user_enable', positional: ['user_id'] },
+};
+
+const user_assign_roles: Operation = {
+  name: 'user_assign_roles',
+  description: 'Replace the set of roles assigned to a user (full replacement, not merge).',
+  params: {
+    user_id: { type: 'string', required: true },
+    roles: { type: 'array', required: true, description: 'Array of role id strings' },
+  },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const { assignUserRoles } = await import('./users.ts');
+    await assignUserRoles(sqlQueryForEngine(ctx.engine), p.user_id as string, p.roles as string[]);
+    return { status: 'roles_updated' };
+  },
+  cliHints: { name: 'user_assign_roles', positional: ['user_id', 'roles'] },
+};
+
+const roles_list: Operation = {
+  name: 'roles_list',
+  description: 'List all roles with their source-access matrix and member count.',
+  params: {},
+  scope: 'users_admin',
+  handler: async (ctx) => {
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const { listRoles } = await import('./roles.ts');
+    return { roles: await listRoles(sqlQueryForEngine(ctx.engine)) };
+  },
+  cliHints: { name: 'roles_list' },
+};
+
+const role_create: Operation = {
+  name: 'role_create',
+  description: 'Create a new role. Role ids share the same charset as source ids: [a-z0-9-]{1,32}.',
+  params: {
+    role_id: { type: 'string', required: true, description: 'Role id [a-z0-9-]{1,32}' },
+    description: { type: 'string', description: 'Human-readable description' },
+  },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const { createRole } = await import('./roles.ts');
+    await createRole(sqlQueryForEngine(ctx.engine), { id: p.role_id as string, description: p.description as string | undefined });
+    return { status: 'created' };
+  },
+  cliHints: { name: 'role_create', positional: ['role_id'] },
+};
+
+const role_set_sources: Operation = {
+  name: 'role_set_sources',
+  description: 'Replace the source-access grants for a role. Full replacement, not merge.',
+  params: {
+    role_id: { type: 'string', required: true },
+    grants: { type: 'array', required: true, description: 'Array of { source_id: string, access: "read"|"write" }' },
+  },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const { setRoleSources } = await import('./roles.ts');
+    await setRoleSources(sqlQueryForEngine(ctx.engine), p.role_id as string, p.grants as Array<{ sourceId: string; access: 'read' | 'write' }>);
+    return { status: 'sources_updated' };
+  },
+  cliHints: { name: 'role_set_sources', positional: ['role_id', 'grants'] },
+};
+
+const role_delete: Operation = {
+  name: 'role_delete',
+  description: 'Delete a role and its source-permission grants. CASCADEs user_roles assignments.',
+  params: { role_id: { type: 'string', required: true } },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const { deleteRole } = await import('./roles.ts');
+    await deleteRole(sqlQueryForEngine(ctx.engine), p.role_id as string);
+    return { status: 'deleted' };
+  },
+  cliHints: { name: 'role_delete', positional: ['role_id'] },
+};
+
 export const operations: Operation[] = [
   // Page CRUD
   get_page, put_page, delete_page, list_pages,
@@ -5454,6 +5630,9 @@ export const operations: Operation[] = [
   takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management
   whoami, sources_add, sources_list, sources_remove, sources_status,
+  // v0.x: multi-user auth — users_admin management ops
+  users_list, user_create, user_set_password, user_disable, user_enable,
+  user_assign_roles, roles_list, role_create, role_set_sources, role_delete,
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.42.x (#2390): Life Chronicle timeline reads
