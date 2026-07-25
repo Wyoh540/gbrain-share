@@ -23,7 +23,7 @@ import type { OAuthServerProvider, AuthorizationParams } from '@modelcontextprot
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import type { AuthInfo as SdkAuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { InvalidTokenError, InvalidClientMetadataError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
-import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
+import { hashToken, generateToken, isUndefinedColumnError, isUndefinedTableError } from './utils.ts';
 import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope } from './legacy-token-scope.ts';
@@ -411,45 +411,63 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
   // Authorization Code Flow
   // -------------------------------------------------------------------------
 
+  /**
+   * Internal helper: the code-issuance core extracted from authorize().
+   * Task 6 (browser login) calls this after password verification; tests
+   * call it directly. Scope clamp, PKCE binding, and TTL are identical to
+   * the old authorize() inline logic (RFC 6749 §3.3 / §4.1.3).
+   */
+  async __testOnlyIssueCodeForUser(
+    clientId: string,
+    params: AuthorizationParams,
+    userId?: string,
+  ): Promise<string> {
+    const client = await this.clientsStore.getClient(clientId);
+    if (!client) throw new Error('Client not found');
+
+    const code = generateToken('gbrain_code_');
+    const codeHash = hashToken(code);
+    const expiresAt = Math.floor(Date.now() / 1000) + 600; // 10 minute TTL
+
+    const allowedScopes = parseScopeString(client.scope);
+    const requestedScopes = (params.scopes && params.scopes.length) ? params.scopes : allowedScopes;
+    const grantedScopes = requestedScopes.filter(s => hasScope(allowedScopes, s));
+
+    try {
+      await this.sql`
+        INSERT INTO oauth_codes (code_hash, client_id, scopes, code_challenge,
+                                  code_challenge_method, redirect_uri, state, resource, expires_at, user_id)
+        VALUES (${codeHash}, ${client.client_id},
+                ${pgArray(grantedScopes)},
+                ${params.codeChallenge}, ${'S256'},
+                ${params.redirectUri}, ${params.state || null},
+                ${params.resource?.toString() || null}, ${expiresAt}, ${userId || null})
+      `;
+    } catch (err) {
+      if (isUndefinedColumnError(err, 'user_id')) {
+        await this.sql`
+          INSERT INTO oauth_codes (code_hash, client_id, scopes, code_challenge,
+                                    code_challenge_method, redirect_uri, state, resource, expires_at)
+          VALUES (${codeHash}, ${client.client_id},
+                  ${pgArray(grantedScopes)},
+                  ${params.codeChallenge}, ${'S256'},
+                  ${params.redirectUri}, ${params.state || null},
+                  ${params.resource?.toString() || null}, ${expiresAt})
+        `;
+      } else {
+        throw err;
+      }
+    }
+
+    return code;
+  }
+
   async authorize(
     client: OAuthClientInformationFull,
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
-    const code = generateToken('gbrain_code_');
-    const codeHash = hashToken(code);
-    const expiresAt = Math.floor(Date.now() / 1000) + 600; // 10 minute TTL
-
-    // Scope clamp (RFC 6749 §3.3): the SDK's authorize handler splits
-    // `?scope=...` verbatim and forwards the raw list to the provider, so
-    // the provider MUST clamp against the client's registered grant. Without
-    // this, a `read`-registered client requesting `?scope=admin` would have
-    // `['admin']` stored in oauth_codes and returned by exchangeAuthorizationCode
-    // as a fully-admin access token. Mirrors the filter pattern already used
-    // by exchangeClientCredentials (this file) and exchangeRefreshToken's F3
-    // subset enforcement (RFC 6749 §6) so all three grant entry points clamp
-    // consistently. When the client requests NO scope, RFC 6749 §3.3 lets the
-    // server fall back to a default — we default to the client's full
-    // registered scope (matching exchangeClientCredentials, which already does
-    // `requestedScope ? ... : allowedScopes`). Previously an omitted request
-    // granted the empty set, which then propagated into the access+refresh
-    // tokens and never self-healed: every op failed `insufficient_scope` even
-    // though the client was registered with `read write`. Clients that omit
-    // `scope` on /authorize (e.g. some MCP connectors) hit this. Still clamped
-    // to the allowed set, so an explicit over-broad request can't escalate.
-    const allowedScopes = parseScopeString(client.scope);
-    const requestedScopes = (params.scopes && params.scopes.length) ? params.scopes : allowedScopes;
-    const grantedScopes = requestedScopes.filter(s => hasScope(allowedScopes, s));
-
-    await this.sql`
-      INSERT INTO oauth_codes (code_hash, client_id, scopes, code_challenge,
-                                code_challenge_method, redirect_uri, state, resource, expires_at)
-      VALUES (${codeHash}, ${client.client_id},
-              ${pgArray(grantedScopes)},
-              ${params.codeChallenge}, ${'S256'},
-              ${params.redirectUri}, ${params.state || null},
-              ${params.resource?.toString() || null}, ${expiresAt})
-    `;
+    const code = await this.__testOnlyIssueCodeForUser(client.client_id, params);
 
     // Redirect back with the code
     const redirectUrl = new URL(params.redirectUri);
@@ -506,14 +524,14 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
             AND client_id = ${client.client_id}
             AND redirect_uri = ${redirectUri}
             AND expires_at > ${now}
-          RETURNING client_id, scopes, resource
+          RETURNING client_id, scopes, resource, user_id
         `
       : await this.sql`
           DELETE FROM oauth_codes
           WHERE code_hash = ${codeHash}
             AND client_id = ${client.client_id}
             AND expires_at > ${now}
-          RETURNING client_id, scopes, resource
+          RETURNING client_id, scopes, resource, user_id
         `;
     if (rows.length === 0) throw new Error('Authorization code not found or expired');
 
@@ -521,7 +539,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
 
     // Issue tokens
     const scopes = (codeRow.scopes as string[]) || [];
-    return this.issueTokens(client.client_id, scopes, resource, true);
+    return this.issueTokens(client.client_id, scopes, resource, true, undefined, codeRow.user_id as string | undefined);
   }
 
   // -------------------------------------------------------------------------
@@ -550,7 +568,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       WHERE token_hash = ${tokenHash}
         AND token_type = 'refresh'
         AND client_id = ${client.client_id}
-      RETURNING client_id, scopes, expires_at
+      RETURNING client_id, scopes, expires_at, user_id
     `;
     if (rows.length === 0) throw new Error('Refresh token not found');
 
@@ -579,7 +597,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       throw new Error('Requested scope exceeds refresh token grant');
     }
     const tokenScopes = scopes ?? grantedScopes;
-    return this.issueTokens(client.client_id, tokenScopes, resource, true);
+    return this.issueTokens(client.client_id, tokenScopes, resource, true, undefined, row.user_id as string | undefined);
   }
 
   // -------------------------------------------------------------------------
@@ -590,50 +608,58 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const tokenHash = hashToken(token);
     const now = Math.floor(Date.now() / 1000);
 
-    // Try OAuth tokens first. JOIN oauth_clients in the same query so
-    // verifyAccessToken returns client_name AND source_id in AuthInfo —
-    // eliminates the separate per-request lookup at serve-http.ts that
-    // was the N+1 hot path (see PR #586 review D14=B; v0.34.1 #861 D2
-    // adds the source_id thread on the same JOIN).
-    //
-    // v0.34.1 (#861): the JOIN guards on a c.source_id column that
-    // migration v60 adds. Pre-v60 brains throw a "column does not exist"
-    // error here — caught at the boundary via isUndefinedColumnError so
-    // unmigrated brains degrade to "no source scope" rather than refusing
-    // every token verification.
+    // v0.42+ (multi-user auth): primary query resolves user-bound tokens with
+    // live role-union permissions. Pre-v119 brains degrade through the existing
+    // chain (v61 → v60 → pre-v60) so auth keeps working until migration.
     let oauthRows: Record<string, unknown>[];
     try {
       oauthRows = await this.sql`
-        SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
-               c.source_id, c.federated_read
+        SELECT t.client_id, t.scopes, t.expires_at, t.resource, t.user_id,
+               c.client_name, c.source_id, c.federated_read,
+               u.status AS user_status, u.username AS username,
+               COALESCE((SELECT array_agg(DISTINCT rsp.source_id)
+                         FROM user_roles ur JOIN role_source_permissions rsp ON rsp.role_id = ur.role_id
+                         WHERE ur.user_id = t.user_id), '{}') AS read_sources,
+               COALESCE((SELECT array_agg(DISTINCT rsp.source_id)
+                         FROM user_roles ur JOIN role_source_permissions rsp ON rsp.role_id = ur.role_id
+                         WHERE ur.user_id = t.user_id AND rsp.access = 'write'), '{}') AS write_sources
         FROM oauth_tokens t
         LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+        LEFT JOIN users u ON u.id = t.user_id
         WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
       `;
     } catch (err) {
-      // v0.34.1: pre-v60 brain → source_id column missing. Pre-v61 brain →
-      // federated_read column missing. Both classes degrade to legacy
-      // projection so auth keeps working until the operator runs
-      // apply-migrations. Probe both column names so partial-upgrade brains
-      // (v60 applied but v61 didn't yet) also fall through cleanly.
-      if (isUndefinedColumnError(err, 'source_id') || isUndefinedColumnError(err, 'federated_read')) {
-        // Try the v60-only projection first (source_id but no federated_read).
+      if (isUndefinedColumnError(err, 'user_id')) {
+        // Pre-v119 fallback: existing v61 query chain.
         try {
           oauthRows = await this.sql`
-            SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name, c.source_id
+            SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
+                   c.source_id, c.federated_read
             FROM oauth_tokens t
             LEFT JOIN oauth_clients c ON c.client_id = t.client_id
             WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
           `;
         } catch (err2) {
-          if (isUndefinedColumnError(err2, 'source_id')) {
-            // Truly pre-v60: no source_id either. Pre-v0.34 projection.
-            oauthRows = await this.sql`
-              SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name
-              FROM oauth_tokens t
-              LEFT JOIN oauth_clients c ON c.client_id = t.client_id
-              WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
-            `;
+          if (isUndefinedColumnError(err2, 'source_id') || isUndefinedColumnError(err2, 'federated_read')) {
+            try {
+              oauthRows = await this.sql`
+                SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name, c.source_id
+                FROM oauth_tokens t
+                LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+                WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
+              `;
+            } catch (err3) {
+              if (isUndefinedColumnError(err3, 'source_id')) {
+                oauthRows = await this.sql`
+                  SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name
+                  FROM oauth_tokens t
+                  LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+                  WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
+                `;
+              } else {
+                throw err3;
+              }
+            }
           } else {
             throw err2;
           }
@@ -645,22 +671,46 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
 
     if (oauthRows.length > 0) {
       const row = oauthRows[0];
-      // NULL expires_at is treated as expired (fail-closed). Schema permits NULL,
-      // and the SDK's bearerAuth requires `typeof expiresAt === 'number'` — we
-      // throw here rather than return an undefined-bearing AuthInfo.
       const expiresAt = coerceTimestamp(row.expires_at);
       if (expiresAt === undefined || expiresAt < now) {
         throw new InvalidTokenError('Token expired');
       }
-      // v0.34.1 (#876): federated_read normalization. SELECT returns
-      // either a JS array (Postgres / PGLite text[] driver mapping) or
-      // undefined when the legacy projection ran (pre-v61 brain). Empty
-      // array vs undefined matters: empty array = explicit no-federated-
-      // read; undefined = column missing on this brain.
+
+      const userId = row.user_id as string | null | undefined;
+      if (userId) {
+        // User-bound token: live role-union resolution.
+        const userStatus = row.user_status as string | null | undefined;
+        if (userStatus !== 'active') {
+          throw new InvalidTokenError('User disabled');
+        }
+        const readRaw = row.read_sources;
+        const writeRaw = row.write_sources;
+        const readSources = Array.isArray(readRaw) ? (readRaw as string[]) : [];
+        const writeSources = Array.isArray(writeRaw) ? (writeRaw as string[]) : [];
+        const sourceId = writeSources.length === 1
+          ? writeSources[0]
+          : (writeSources[0] ?? readSources[0]);
+        return {
+          token,
+          clientId: row.client_id as string,
+          clientName: (row.client_name as string | null) ?? undefined,
+          scopes: (row.scopes as string[]) || [],
+          expiresAt,
+          resource: row.resource ? new URL(row.resource as string) : undefined,
+          sourceId,
+          allowedSources: readSources,
+          writeSources,
+          userId,
+          username: (row.username as string | null) ?? undefined,
+        } as CoreAuthInfo as SdkAuthInfo;
+      }
+
+      // Machine client / legacy token (user_id absent or NULL).
       const federatedRaw = row.federated_read;
       const allowedSources = Array.isArray(federatedRaw)
         ? (federatedRaw as string[])
         : undefined;
+      const sourceId = (row.source_id as string | null) ?? undefined;
       return {
         token,
         clientId: row.client_id as string,
@@ -668,14 +718,9 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         scopes: (row.scopes as string[]) || [],
         expiresAt,
         resource: row.resource ? new URL(row.resource as string) : undefined,
-        // v0.34.1 (#861, D2): source-isolation scope from oauth_clients.
-        // Undefined when the row predates v60 or when the brain itself
-        // predates v60 (fell through to the legacy projection above).
-        sourceId: (row.source_id as string | null) ?? undefined,
-        // v0.34.1 (#876): federated read scope. sourceScopeOpts in
-        // operations.ts prefers this array over scalar sourceId when set
-        // and non-empty.
+        sourceId,
         allowedSources,
+        writeSources: sourceId ? [sourceId] : undefined,
       } as CoreAuthInfo as SdkAuthInfo;
     }
 
@@ -879,7 +924,16 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const deletedCodes = await this.sql`
       DELETE FROM oauth_codes WHERE expires_at < ${now} RETURNING 1
     `;
-    return result.length + deletedCodes.length;
+    let deletedPending = 0;
+    try {
+      const pending = await this.sql`
+        DELETE FROM oauth_pending_logins WHERE expires_at < ${now} RETURNING 1
+      `;
+      deletedPending = pending.length;
+    } catch (err) {
+      if (!isUndefinedColumnError(err, 'expires_at') && !isUndefinedTableError(err)) throw err;
+    }
+    return result.length + deletedCodes.length + deletedPending;
   }
 
   // -------------------------------------------------------------------------
@@ -1016,6 +1070,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     resource: URL | undefined,
     includeRefresh: boolean,
     ttlOverride?: number,
+    userId?: string,
   ): Promise<OAuthTokens> {
     const accessToken = generateToken('gbrain_at_');
     const accessHash = hashToken(accessToken);
@@ -1023,11 +1078,23 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const effectiveTtl = ttlOverride || this.tokenTtl;
     const accessExpiry = now + effectiveTtl;
 
-    await this.sql`
-      INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
-      VALUES (${accessHash}, ${'access'}, ${clientId},
-              ${pgArray(scopes)}, ${accessExpiry}, ${resource?.toString() || null})
-    `;
+    try {
+      await this.sql`
+        INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource, user_id)
+        VALUES (${accessHash}, ${'access'}, ${clientId},
+                ${pgArray(scopes)}, ${accessExpiry}, ${resource?.toString() || null}, ${userId || null})
+      `;
+    } catch (err) {
+      if (isUndefinedColumnError(err, 'user_id')) {
+        await this.sql`
+          INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
+          VALUES (${accessHash}, ${'access'}, ${clientId},
+                  ${pgArray(scopes)}, ${accessExpiry}, ${resource?.toString() || null})
+        `;
+      } else {
+        throw err;
+      }
+    }
 
     const result: OAuthTokens = {
       access_token: accessToken,
@@ -1041,11 +1108,23 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       const refreshHash = hashToken(refreshToken);
       const refreshExpiry = now + this.refreshTtl;
 
-      await this.sql`
-        INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
-        VALUES (${refreshHash}, ${'refresh'}, ${clientId},
-                ${pgArray(scopes)}, ${refreshExpiry}, ${resource?.toString() || null})
-      `;
+      try {
+        await this.sql`
+          INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource, user_id)
+          VALUES (${refreshHash}, ${'refresh'}, ${clientId},
+                  ${pgArray(scopes)}, ${refreshExpiry}, ${resource?.toString() || null}, ${userId || null})
+        `;
+      } catch (err) {
+        if (isUndefinedColumnError(err, 'user_id')) {
+          await this.sql`
+            INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
+            VALUES (${refreshHash}, ${'refresh'}, ${clientId},
+                    ${pgArray(scopes)}, ${refreshExpiry}, ${resource?.toString() || null})
+          `;
+        } else {
+          throw err;
+        }
+      }
 
       result.refresh_token = refreshToken;
     }
