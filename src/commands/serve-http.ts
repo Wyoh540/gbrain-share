@@ -29,6 +29,8 @@ import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { RateLimiter } from '../mcp/rate-limit.ts';
+import { verifyUserPassword, createUser, listUsers, setUserPassword, disableUser, enableUser, assignUserRoles } from '../core/users.ts';
+import { listRoles, createRole as createRoleStore, setRoleSources, deleteRole as deleteRoleStore } from '../core/roles.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
@@ -971,17 +973,27 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   // v0.40 D15.5: safeHexEqual extracted to src/core/timing-safe.ts so the new
   // /webhooks/github HMAC verifier reuses the same constant-time compare.
-  // POST /admin/login — JSON body with token (for programmatic/UI login)
-  app.post('/admin/login', express.json(), (req, res) => {
-    const token = req.body?.token;
-    if (!token || typeof token !== 'string') {
-      res.status(400).json({ error: 'Token required' });
-      return;
-    }
+  // POST /admin/login — JSON body with token (bootstrap) or username+password
+  app.post('/admin/login', express.json(), async (req, res) => {
+    const { token, username, password } = req.body || {};
 
-    const tokenHash = createHash('sha256').update(token).digest('hex');
-    if (!safeHexEqual(tokenHash, bootstrapHash)) {
-      res.status(401).json({ error: 'Invalid token. Check your terminal output.' });
+    // Bootstrap-token login (existing path)
+    if (token && typeof token === 'string') {
+      const tokenHash = createHash('sha256').update(token).digest('hex');
+      if (!safeHexEqual(tokenHash, bootstrapHash)) {
+        res.status(401).json({ error: 'Invalid token. Check your terminal output.' });
+        return;
+      }
+    } else if (username && typeof username === 'string' && password && typeof password === 'string') {
+      // Multi-user auth: username+password login (admin access required)
+      const adminSql = sqlQueryForEngine(engine as any);
+      const user = await verifyUserPassword(adminSql, username, password);
+      if (!user || !user.isAdmin) {
+        res.status(401).json({ error: 'Invalid admin credentials' });
+        return;
+      }
+    } else {
+      res.status(400).json({ error: 'Token or username+password required' });
       return;
     }
 
@@ -1123,6 +1135,117 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   // Admin API endpoints
   // ---------------------------------------------------------------------------
+
+  // Bootstrap-first-admin: open ONLY when no users exist AND token matches.
+  app.post('/admin/api/bootstrap-first-admin', express.json(), async (req, res) => {
+    const { bootstrapToken, username, password } = req.body || {};
+    if (!bootstrapToken || !username || !password) {
+      res.status(400).json({ error: 'bootstrapToken, username, and password required' });
+      return;
+    }
+    const tokenHash = createHash('sha256').update(bootstrapToken).digest('hex');
+    if (!safeHexEqual(tokenHash, bootstrapHash)) {
+      res.status(403).json({ error: 'Invalid bootstrap token' });
+      return;
+    }
+    const adminSql = sqlQueryForEngine(engine as any);
+    const existing = await adminSql`SELECT count(*)::int AS cnt FROM users`;
+    if ((existing[0] as any).cnt > 0) {
+      res.status(403).json({ error: 'First admin already exists — use /admin/login instead' });
+      return;
+    }
+    const user = await createUser(adminSql, { username, password, isAdmin: true });
+    // First admin doesn't need password reset
+    await adminSql`UPDATE users SET must_reset_password = false WHERE id = ${user.id}`;
+    res.json({ status: 'created', userId: user.id });
+  });
+
+  // Users API — requires admin session
+  app.get('/admin/api/users', requireAdmin, async (_req, res) => {
+    try {
+      const adminSql = sqlQueryForEngine(engine as any);
+      const users = await listUsers(adminSql);
+      res.json({ users });
+    } catch (err: any) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.post('/admin/api/users', requireAdmin, express.json(), async (req, res) => {
+    try {
+      const { username, password, display_name, email, is_admin } = req.body;
+      if (!username || !password) { res.status(400).json({ error: 'username and password required' }); return; }
+      const adminSql = sqlQueryForEngine(engine as any);
+      const user = await createUser(adminSql, { username, password, displayName: display_name, email, isAdmin: is_admin });
+      res.json(user);
+    } catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
+
+  app.post('/admin/api/users/:id/password', requireAdmin, express.json(), async (req, res) => {
+    try {
+      const { password } = req.body;
+      if (!password) { res.status(400).json({ error: 'password required' }); return; }
+      const adminSql = sqlQueryForEngine(engine as any);
+      await setUserPassword(adminSql, String(req.params.id), password);
+      res.json({ status: 'password_updated' });
+    } catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
+
+  app.post('/admin/api/users/:id/status', requireAdmin, express.json(), async (req, res) => {
+    try {
+      const { status } = req.body;
+      if (!status || (status !== 'active' && status !== 'disabled')) { res.status(400).json({ error: 'status must be "active" or "disabled"' }); return; }
+      const adminSql = sqlQueryForEngine(engine as any);
+      if (status === 'disabled') await disableUser(adminSql, String(req.params.id));
+      else await enableUser(adminSql, String(req.params.id));
+      res.json({ status });
+    } catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
+
+  app.post('/admin/api/users/:id/roles', requireAdmin, express.json(), async (req, res) => {
+    try {
+      const { roles } = req.body;
+      if (!Array.isArray(roles)) { res.status(400).json({ error: 'roles array required' }); return; }
+      const adminSql = sqlQueryForEngine(engine as any);
+      await assignUserRoles(adminSql, String(req.params.id), roles);
+      res.json({ status: 'roles_updated' });
+    } catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
+
+  // Roles API — requires admin session
+  app.get('/admin/api/roles', requireAdmin, async (_req, res) => {
+    try {
+      const adminSql = sqlQueryForEngine(engine as any);
+      const roles = await listRoles(adminSql);
+      res.json({ roles });
+    } catch (err: any) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.post('/admin/api/roles', requireAdmin, express.json(), async (req, res) => {
+    try {
+      const { role_id, description } = req.body;
+      if (!role_id) { res.status(400).json({ error: 'role_id required' }); return; }
+      const adminSql = sqlQueryForEngine(engine as any);
+      await createRoleStore(adminSql, { id: role_id, description });
+      res.json({ status: 'created' });
+    } catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
+
+  app.post('/admin/api/roles/:id/sources', requireAdmin, express.json(), async (req, res) => {
+    try {
+      const { grants } = req.body;
+      if (!Array.isArray(grants)) { res.status(400).json({ error: 'grants array required' }); return; }
+      const adminSql = sqlQueryForEngine(engine as any);
+      await setRoleSources(adminSql, String(req.params.id), grants);
+      res.json({ status: 'sources_updated' });
+    } catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
+
+  app.delete('/admin/api/roles/:id', requireAdmin, async (req, res) => {
+    try {
+      const adminSql = sqlQueryForEngine(engine as any);
+      await deleteRoleStore(adminSql, String(req.params.id));
+      res.json({ status: 'deleted' });
+    } catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
 
   // Sign-out-everywhere: nuke ALL active admin sessions in-memory. Every
   // browser/tab fails its next request, gets 401, redirects to login.
