@@ -34,8 +34,11 @@ async function apiFetchText(path: string) {
 }
 
 export const api = {
-  login: (token: string) => apiFetch('/admin/login', { method: 'POST', body: JSON.stringify({ token }) }),
-  signOutEverywhere: () => apiFetch('/admin/api/sign-out-everywhere', { method: 'POST' }),
+  login: (token: string, username?: string, password?: string) => {
+    const body: Record<string, string> = { token };
+    if (username && password) { body.username = username; body.password = password; }
+    return apiFetch('/admin/login', { method: 'POST', body: JSON.stringify(body) });
+  },
   stats: () => apiFetch('/admin/api/stats'),
   health: () => apiFetch('/admin/api/health-indicators'),
   agents: () => apiFetch('/admin/api/agents'),
@@ -52,4 +55,21 @@ export const api = {
     apiFetchText(`/admin/api/calibration/charts/${encodeURIComponent(type)}${holder ? `?holder=${encodeURIComponent(holder)}` : ''}`),
   // v0.41 D2 — live minion-jobs dashboard snapshot.
   jobsWatch: () => apiFetch('/admin/api/jobs/watch'),
+  // Multi-user auth — users & roles management
+  listUsers: () => apiFetch('/admin/api/users'),
+  createUser: (username: string, password: string, displayName?: string, email?: string, isAdmin?: boolean) =>
+    apiFetch('/admin/api/users', { method: 'POST', body: JSON.stringify({ username, password, display_name: displayName, email, is_admin: isAdmin }) }),
+  resetUserPassword: (userId: string, password: string) =>
+    apiFetch(`/admin/api/users/${encodeURIComponent(userId)}/password`, { method: 'POST', body: JSON.stringify({ password }) }),
+  setUserStatus: (userId: string, status: 'active' | 'disabled') =>
+    apiFetch(`/admin/api/users/${encodeURIComponent(userId)}/status`, { method: 'POST', body: JSON.stringify({ status }) }),
+  setUserRoles: (userId: string, roles: string[]) =>
+    apiFetch(`/admin/api/users/${encodeURIComponent(userId)}/roles`, { method: 'POST', body: JSON.stringify({ roles }) }),
+  listRoles: () => apiFetch('/admin/api/roles'),
+  createRole: (id: string, description?: string) =>
+    apiFetch('/admin/api/roles', { method: 'POST', body: JSON.stringify({ role_id: id, description }) }),
+  setRoleSources: (roleId: string, grants: Array<{ sourceId: string; access: 'read' | 'write' }>) =>
+    apiFetch(`/admin/api/roles/${encodeURIComponent(roleId)}/sources`, { method: 'POST', body: JSON.stringify({ grants }) }),
+  deleteRole: (roleId: string) =>
+    apiFetch(`/admin/api/roles/${encodeURIComponent(roleId)}`, { method: 'DELETE' }),
 };

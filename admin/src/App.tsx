@@ -5,13 +5,15 @@ import { AgentsPage } from './pages/Agents';
 import { RequestLogPage } from './pages/RequestLog';
 import { CalibrationPage } from './pages/Calibration';
 import { JobsWatchPage } from './pages/JobsWatch';
+import { UsersPage } from './pages/Users';
+import { RolesPage } from './pages/Roles';
 import { api } from './api';
 
-type Page = 'login' | 'dashboard' | 'agents' | 'log' | 'calibration' | 'jobs';
+type Page = 'login' | 'dashboard' | 'agents' | 'log' | 'calibration' | 'jobs' | 'users' | 'roles';
 
 function getPage(): Page {
   const hash = window.location.hash.replace('#', '') || 'dashboard';
-  if (['login', 'dashboard', 'agents', 'log', 'calibration', 'jobs'].includes(hash)) return hash as Page;
+  if (['login', 'dashboard', 'agents', 'log', 'calibration', 'jobs', 'users', 'roles'].includes(hash)) return hash as Page;
   return 'dashboard';
 }
 
@@ -58,8 +60,12 @@ export function App() {
              onClick={() => navigate('log')}>Request Log</a>
           <a className={`nav-item ${page === 'calibration' ? 'active' : ''}`}
              onClick={() => navigate('calibration')}>Calibration</a>
-          <a className={`nav-item ${page === 'jobs' ? 'active' : ''}`}
-             onClick={() => navigate('jobs')}>Jobs Watch</a>
+           <a className={`nav-item ${page === 'jobs' ? 'active' : ''}`}
+              onClick={() => navigate('jobs')}>Jobs Watch</a>
+           <a className={`nav-item ${page === 'users' ? 'active' : ''}`}
+              onClick={() => navigate('users')}>Users</a>
+           <a className={`nav-item ${page === 'roles' ? 'active' : ''}`}
+              onClick={() => navigate('roles')}>Roles</a>
         </div>
         <div style={{ marginTop: 'auto', padding: '16px 12px', borderTop: '1px solid var(--border)' }}>
           <button
@@ -85,7 +91,9 @@ export function App() {
         {page === 'agents' && <AgentsPage />}
         {page === 'log' && <RequestLogPage />}
         {page === 'calibration' && <CalibrationPage />}
-        {page === 'jobs' && <JobsWatchPage />}
+         {page === 'jobs' && <JobsWatchPage />}
+         {page === 'users' && <UsersPage />}
+         {page === 'roles' && <RolesPage />}
       </main>
     </div>
   );
