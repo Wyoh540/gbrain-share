@@ -84,6 +84,8 @@ interface AuthResult {
    * Bounded to the stored grant — never widened to "all".
    */
   auth?: AuthInfo;
+  /** Username of the user who created this token (from permissions.created_by_username). */
+  ownerUsername?: string;
 }
 
 /* Legacy token source-scope parsing lives in core/legacy-token-scope.ts and is
@@ -212,6 +214,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         : ['world'];
       // #1336: honor the operator-set source grant stored on the token.
       const { sourceId, allowedSources } = parseLegacyTokenScope(perms?.source_id);
+      const ownerUsername = (perms as Record<string, unknown> | undefined)?.created_by_username as string | undefined;
       const auth: AuthInfo = {
         token,
         clientId: rowId,
@@ -229,15 +232,16 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         // source unless the token carries an explicit grant (#1336 above).
         sourceId,
         auth,
+        ownerUsername,
       };
     } catch {
       return { ok: false };
     }
   }
 
-  function logRequest(tokenName: string | null, operation: string, status: string, latencyMs: number) {
-    sql`INSERT INTO mcp_request_log (token_name, operation, latency_ms, status)
-        VALUES (${tokenName}, ${operation}, ${latencyMs}, ${status})`
+  function logRequest(tokenName: string | null, operation: string, status: string, latencyMs: number, username?: string | null) {
+    sql`INSERT INTO mcp_request_log (token_name, operation, latency_ms, status, username)
+        VALUES (${tokenName}, ${operation}, ${latencyMs}, ${status}, ${username ?? null})`
       .catch(() => { /* best-effort */ });
   }
 
@@ -283,7 +287,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       // Pre-auth IP rate limit. Fires BEFORE the DB lookup so we actually limit brute-force load.
       const ipCheck = limiters.ip.check(ip);
       if (!ipCheck.allowed) {
-        logRequest(null, 'unknown', 'rate_limited', Date.now() - startedMs);
+        logRequest(null, 'unknown', 'rate_limited', Date.now() - startedMs, null);
         return Response.json(
           { error: 'rate_limited', message: 'Too many requests' },
           {
@@ -296,7 +300,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       // Body cap (stream-counted; chunked transfers caught here, not at req.json).
       const bodyText = await readBodyWithCap(req, bodyCap);
       if (bodyText === null) {
-        logRequest(null, 'unknown', 'body_too_large', Date.now() - startedMs);
+        logRequest(null, 'unknown', 'body_too_large', Date.now() - startedMs, null);
         return Response.json(
           { error: 'payload_too_large', message: `Request body exceeds ${bodyCap} bytes` },
           { status: 413, headers: corsHeaders(origin) },
@@ -306,7 +310,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       // Auth.
       const auth = await validateToken(req.headers.get('Authorization'));
       if (!auth.ok) {
-        logRequest(null, 'unknown', 'auth_failed', Date.now() - startedMs);
+        logRequest(null, 'unknown', 'auth_failed', Date.now() - startedMs, null);
         return Response.json(
           { error: 'invalid_token', message: 'Bearer token required. Create one: gbrain auth create <name>' },
           { status: 401, headers: corsHeaders(origin) },
@@ -316,7 +320,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       // Post-auth token-id rate limit. Limits runaway authed clients.
       const tokCheck = limiters.token.check(auth.tokenId!);
       if (!tokCheck.allowed) {
-        logRequest(auth.tokenName!, 'unknown', 'rate_limited', Date.now() - startedMs);
+        logRequest(auth.tokenName!, 'unknown', 'rate_limited', Date.now() - startedMs, auth.ownerUsername);
         return Response.json(
           { error: 'rate_limited', message: 'Too many requests for this token' },
           {
@@ -331,7 +335,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       try {
         body = JSON.parse(bodyText);
       } catch (e: any) {
-        logRequest(auth.tokenName!, 'unknown', 'parse_error', Date.now() - startedMs);
+        logRequest(auth.tokenName!, 'unknown', 'parse_error', Date.now() - startedMs, auth.ownerUsername);
         return Response.json(
           { error: 'parse_error', message: e?.message ?? 'invalid JSON' },
           { status: 400, headers: corsHeaders(origin) },
@@ -342,7 +346,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
 
       // initialize
       if (method === 'initialize') {
-        logRequest(auth.tokenName!, 'initialize', 'success', Date.now() - startedMs);
+        logRequest(auth.tokenName!, 'initialize', 'success', Date.now() - startedMs, auth.ownerUsername);
         return Response.json(
           {
             result: {
@@ -364,7 +368,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
 
       // tools/list
       if (method === 'tools/list') {
-        logRequest(auth.tokenName!, 'tools/list', 'success', Date.now() - startedMs);
+        logRequest(auth.tokenName!, 'tools/list', 'success', Date.now() - startedMs, auth.ownerUsername);
         return Response.json(
           { result: { tools }, jsonrpc: '2.0', id },
           { headers: corsHeaders(origin) },
@@ -388,14 +392,14 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
           auth: auth.auth,
         });
         const status = result.isError ? 'error' : 'success';
-        logRequest(auth.tokenName!, `tools/call:${toolName}`, status, Date.now() - startedMs);
+        logRequest(auth.tokenName!, `tools/call:${toolName}`, status, Date.now() - startedMs, auth.ownerUsername);
         return Response.json(
           { result, jsonrpc: '2.0', id },
           { headers: corsHeaders(origin) },
         );
       }
 
-      logRequest(auth.tokenName!, method ?? 'unknown', 'unknown_method', Date.now() - startedMs);
+      logRequest(auth.tokenName!, method ?? 'unknown', 'unknown_method', Date.now() - startedMs, auth.ownerUsername);
       return Response.json(
         { error: 'unknown_method', message: `Unknown method: ${method}` },
         { status: 400, headers: corsHeaders(origin) },

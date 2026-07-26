@@ -10,6 +10,7 @@ interface LogEntry {
   status: string;
   params: Record<string, unknown> | null;
   error_message: string | null;
+  username?: string | null;
   created_at: string;
 }
 
@@ -76,6 +77,7 @@ export function RequestLogPage() {
               <tr>
                 <th>Time</th>
                 <th>Agent</th>
+                <th>User</th>
                 <th>Operation</th>
                 <th>Params</th>
                 <th>Latency</th>
@@ -94,6 +96,9 @@ export function RequestLogPage() {
                         {r.agent_name || r.token_name}
                       </a>
                     </td>
+                    <td style={{ color: r.username ? 'var(--text-secondary)' : 'var(--text-muted)', fontSize: 13 }}>
+                      {r.username || '\u2014'}
+                    </td>
                     <td className="mono">{r.operation}</td>
                     <td style={{ color: 'var(--text-secondary)', fontSize: 12, maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {formatParams(r.params)}
@@ -103,12 +108,14 @@ export function RequestLogPage() {
                   </tr>
                   {expandedRow === r.id && (
                     <tr>
-                      <td colSpan={6} style={{ background: 'var(--bg-secondary, #0f0f1a)', padding: 16 }}>
+                      <td colSpan={7} style={{ background: 'var(--bg-secondary, #0f0f1a)', padding: 16 }}>
                         <div style={{ display: 'grid', gridTemplateColumns: '100px 1fr', gap: '6px 12px', fontSize: 13 }}>
                           <span style={{ color: 'var(--text-muted)' }}>Time</span>
                           <span>{new Date(r.created_at).toLocaleString()}</span>
                           <span style={{ color: 'var(--text-muted)' }}>Agent</span>
                           <span className="mono">{r.token_name}</span>
+                          <span style={{ color: 'var(--text-muted)' }}>User</span>
+                          <span>{r.username || '\u2014'}</span>
                           <span style={{ color: 'var(--text-muted)' }}>Operation</span>
                           <span className="mono">{r.operation}</span>
                           <span style={{ color: 'var(--text-muted)' }}>Latency</span>

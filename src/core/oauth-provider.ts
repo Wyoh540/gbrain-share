@@ -907,6 +907,9 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       const sourceGrant = permissions && typeof permissions === 'object'
         ? (permissions as Record<string, unknown>).source_id
         : undefined;
+      const createdByUsername = permissions && typeof permissions === 'object'
+        ? (permissions as Record<string, unknown>).created_by_username as string | undefined
+        : undefined;
       const { sourceId, allowedSources } = parseLegacyTokenScope(sourceGrant);
       return {
         token,
@@ -919,6 +922,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // allowedSources for federated reads, matching legacy HTTP transport.
         sourceId,
         allowedSources,
+        username: createdByUsername,
       } as CoreAuthInfo as SdkAuthInfo;
     }
 

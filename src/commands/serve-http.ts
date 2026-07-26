@@ -1312,7 +1312,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           CASE WHEN c.deleted_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
           (SELECT max(created_at) FROM mcp_request_log WHERE token_name = c.client_id) as last_used_at,
           (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id) as total_requests,
-          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id AND created_at > now() - interval '24 hours') as requests_today
+          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id AND created_at > now() - interval '24 hours') as requests_today,
+          NULL as owner_username
         FROM oauth_clients c ORDER BY c.created_at DESC
       `;
       const legacyKeys = await sql`
@@ -1321,7 +1322,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           CASE WHEN a.revoked_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
           a.last_used_at,
           (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name) as total_requests,
-          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name AND created_at > now() - interval '24 hours') as requests_today
+          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name AND created_at > now() - interval '24 hours') as requests_today,
+          NULLIF(a.permissions->>'created_by_username', '') as owner_username
         FROM access_tokens a ORDER BY a.created_at DESC
       `;
       res.json([...oauthClients, ...legacyKeys]);
@@ -1591,7 +1593,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       const rows = await engine.executeRaw(
         `SELECT id, token_name, COALESCE(agent_name, token_name) as agent_name,
-                operation, latency_ms, status, params, error_message, created_at
+                operation, latency_ms, status, params, error_message, username, created_at
          FROM mcp_request_log
          WHERE 1=1 ${filterSql}
          ORDER BY created_at DESC LIMIT ${limitParam} OFFSET ${offsetParam}`,
@@ -1743,7 +1745,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const ses = (req as any).sessionUser as SessionEntry;
       const keys = await sql`
         SELECT id, name, created_at, last_used_at,
-          CASE WHEN revoked_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status
+          CASE WHEN revoked_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
+          permissions->>'raw_token' as token
         FROM access_tokens
         WHERE permissions->>'created_by_user_id' = ${ses.userId}
         ORDER BY created_at DESC
@@ -1768,7 +1771,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const token = generateToken('gbrain_');
       const hash = hashToken(token);
       const id = (await import('crypto')).randomUUID();
-      await sql`INSERT INTO access_tokens (id, name, token_hash, permissions) VALUES (${id}, ${name}, ${hash}, ${JSON.stringify({ created_by_user_id: ses.userId, created_by_username: ses.username })})`;
+      await sql`INSERT INTO access_tokens (id, name, token_hash, permissions) VALUES (${id}, ${name}, ${hash}, ${JSON.stringify({ created_by_user_id: ses.userId, created_by_username: ses.username, raw_token: token })})`;
       res.json({ name, token, id });
     } catch (e) {
       res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to create API key' });
@@ -1998,9 +2001,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       try {
         await executeRawJsonb(
           engine,
-          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-          [authInfo.clientId, agentName, 'tools/list', latency, 'success'],
+          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params, username)
+           VALUES ($1, $2, $3, $4, $5, $7::jsonb, $6)`,
+          [authInfo.clientId, agentName, 'tools/list', latency, 'success', authInfo.username ?? null],
           [null],
         );
       } catch { /* best effort */ }
@@ -2038,9 +2041,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         try {
           await executeRawJsonb(
             engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', `unknown_operation: ${name}`],
+            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params, username)
+             VALUES ($1, $2, $3, $4, $5, $6, $8::jsonb, $7)`,
+            [authInfo.clientId, agentName, name, latency, 'error', `unknown_operation: ${name}`, authInfo.username ?? null],
             [null],
           );
         } catch { /* best effort */ }
@@ -2070,9 +2073,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         try {
           await executeRawJsonb(
             engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', `insufficient_scope: requires '${requiredScope}'`],
+            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params, username)
+             VALUES ($1, $2, $3, $4, $5, $6, $8::jsonb, $7)`,
+            [authInfo.clientId, agentName, name, latency, 'error', `insufficient_scope: requires '${requiredScope}'`, authInfo.username ?? null],
             [null],
           );
         } catch { /* best effort */ }
@@ -2166,9 +2169,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         try {
           await executeRawJsonb(
             engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', errorPayload.message],
+            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params, username)
+             VALUES ($1, $2, $3, $4, $5, $6, $8::jsonb, $7)`,
+            [authInfo.clientId, agentName, name, latency, 'error', errorPayload.message, authInfo.username ?? null],
             [logParamsObj],
           );
         } catch { /* best effort */ }
@@ -2198,9 +2201,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         try {
           await executeRawJsonb(
             engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', errMsg],
+            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params, username)
+             VALUES ($1, $2, $3, $4, $5, $6, $8::jsonb, $7)`,
+            [authInfo.clientId, agentName, name, latency, 'error', errMsg, authInfo.username ?? null],
             [logParamsObj],
           );
         } catch { /* best effort */ }
@@ -2220,9 +2223,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       try {
         await executeRawJsonb(
           engine,
-          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-          [authInfo.clientId, agentName, name, latency, 'success'],
+          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params, username)
+           VALUES ($1, $2, $3, $4, $5, $7::jsonb, $6)`,
+          [authInfo.clientId, agentName, name, latency, 'success', authInfo.username ?? null],
           [logParamsObj],
         );
       } catch { /* best effort */ }
@@ -2457,9 +2460,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         try {
           await executeRawJsonb(
             engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-            [authInfo.clientId, agentName, 'webhook_ingest', latency, 'success'],
+            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params, username)
+             VALUES ($1, $2, $3, $4, $5, $7::jsonb, $6)`,
+            [authInfo.clientId, agentName, 'webhook_ingest', latency, 'success', authInfo.username ?? null],
             [{ content_type: contentType, content_hash: contentHash, bytes: body.length, job_id: job.id }],
           );
         } catch { /* best effort */ }

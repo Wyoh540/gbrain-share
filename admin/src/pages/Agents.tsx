@@ -24,6 +24,7 @@ interface Agent {
   requests_today: number;
   token_ttl: number | null;
   status: 'active' | 'revoked';
+  owner_username?: string | null;
 }
 
 interface ApiKey {
@@ -86,6 +87,7 @@ export function AgentsPage() {
             <thead>
               <tr>
                 <th>Name</th>
+                <th>Owner</th>
                 <th>Type</th>
                 <th>Scopes</th>
                 <th>Status</th>
@@ -98,6 +100,9 @@ export function AgentsPage() {
                 <tr key={a.id} onClick={() => setSelectedAgent(a)}
                     style={{ cursor: 'pointer' }}>
                   <td style={{ fontWeight: 500 }}>{a.name || a.client_name}</td>
+                  <td style={{ color: a.owner_username ? 'var(--text-secondary)' : 'var(--text-muted)', fontSize: 13 }}>
+                    {a.owner_username || '\u2014'}
+                  </td>
                   <td>
                     <span className={`badge ${a.auth_type === 'oauth' ? 'badge-read' : 'badge-write'}`} style={{ fontSize: 11 }}>
                       {a.auth_type === 'oauth' ? 'OAuth' : 'API Key'}
@@ -543,6 +548,8 @@ function AgentDrawer({ agent, onClose, onRevoked }: { agent: Agent; onClose: () 
         <div style={{ display: 'grid', gridTemplateColumns: '100px 1fr', gap: '6px 12px', fontSize: 13 }}>
           <span style={{ color: 'var(--text-secondary)' }}>Client ID</span>
           <span className="mono">{(agent.id || agent.id || agent.client_id || '').substring(0, 24)}...</span>
+          <span style={{ color: 'var(--text-secondary)' }}>Owner</span>
+          <span style={{ color: agent.owner_username ? 'var(--text-primary)' : 'var(--text-muted)' }}>{agent.owner_username || '\u2014'}</span>
           <span style={{ color: 'var(--text-secondary)' }}>Scopes</span>
           <span>{(agent.scope || '').split(' ').filter(Boolean).map(s => (
             <span key={s} className={`badge badge-${s}`} style={{ marginRight: 4 }}>{s}</span>
