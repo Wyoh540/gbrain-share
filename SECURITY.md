@@ -270,3 +270,75 @@ admin SSE feed at `/admin/events`. Operators on a personal laptop who want
 raw payloads back can pass `gbrain serve --http --log-full-params` (loud
 stderr warning at startup). Multi-tenant deployments should leave it
 on the redacted default.
+
+## Multi-User Auth — Login Page Threat Model
+
+The browser login page at `/authorize` (multi-user auth, v125+) introduces a
+human-facing authentication surface. The following hardening is in place:
+
+### Single-use pending logins
+
+When a user hits `/authorize`, the server creates a pending-login row with a
+cryptographic nonce (`gbrain_pl_*`, 10-minute TTL). The nonce is single-use:
+`completeLogin` atomically deletes the row on first attempt. Successful login
+issues a one-time OAuth authorization code; failed login burns the nonce.
+Replay is not possible — the DELETE+RETURNING is atomic.
+
+### Argon2id password hashing
+
+All user passwords are hashed with `Bun.password.hash()` using the argon2id
+algorithm (memory-hard, configurable cost). Plaintext passwords are never
+stored. Password verification runs through `Bun.password.verify()` with
+constant-time comparison.
+
+### Timing equalization
+
+Failed login attempts against a non-existent username still run a dummy
+`Bun.password.verify()` against a constant hash, preventing username
+enumeration via timing side channels.
+
+### Generic error messages
+
+The login page renders a single generic error slot: "Invalid credentials."
+It does not distinguish between "user not found," "wrong password," or
+"account disabled" — all three return the same message to the browser.
+
+### Disabled-user immediacy
+
+When a user is disabled (via admin dashboard or `user_disable` MCP op),
+existing access tokens are invalidated on the next `verifyAccessToken` call
+— the token query JOINs `users.status` and rejects tokens where
+`status != 'active'`. No waiting period; disable takes immediate effect.
+
+### Rate limiting
+
+Two login rate-limiting buckets are applied server-side:
+
+| Bucket | Scope | Default |
+|--------|-------|---------|
+| Per-IP login attempts | `/authorize/login` POST handler | 10 req / 60s (token-bucket) |
+| Per-username login attempts | Keyed from the request body | 5 attempts before nonce is burned |
+
+The per-username limit uses an `attempts` counter on the pending-login row
+(MAX 5). After 5 failed attempts the nonce is burned and the user must
+restart sign-in from their app. This prevents brute-force credential
+stuffing against known usernames.
+
+### Content Security Policy
+
+The login page HTML is served with a strict Content-Security-Policy:
+
+```
+default-src 'none'; style-src 'unsafe-inline'
+```
+
+No external assets, no inline scripts beyond the form's autocomplete
+attributes. Every interpolated value (client name, which comes from the
+database) is HTML-escaped before insertion.
+
+### HTTPS + Secure cookies
+
+When deployed behind HTTPS or a `--public-url` proxy, the admin session
+cookie (`gbrain_admin`) carries `Secure; HttpOnly; SameSite=Strict` flags.
+In development (plain HTTP localhost), the `Secure` flag is omitted so the
+cookie works over `http://127.0.0.1`.

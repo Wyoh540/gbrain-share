@@ -1390,6 +1390,8 @@ const restore_page: Operation = {
   handler: async (ctx, p) => {
     const slug = p.slug as string;
     if (ctx.dryRun) return { dry_run: true, action: 'restore_page', slug };
+    // Multi-user auth: resolve write source for user tokens.
+    if (ctx.remote !== false && ctx.auth) ctx.sourceId = resolveWriteScope(ctx, undefined);
     // v0.31.8 (D7): thread ctx.sourceId.
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
     const ok = await ctx.engine.restorePage(slug, sourceOpts);

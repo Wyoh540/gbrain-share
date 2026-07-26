@@ -8,8 +8,14 @@ interface Role {
   memberCount: number;
 }
 
+interface Source {
+  id: string;
+  name: string;
+}
+
 export function RolesPage() {
   const [roles, setRoles] = useState<Role[]>([]);
+  const [sources, setSources] = useState<Source[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -17,27 +23,34 @@ export function RolesPage() {
   const [newRoleId, setNewRoleId] = useState('');
   const [newRoleDesc, setNewRoleDesc] = useState('');
   const [grants, setGrants] = useState<Record<string, 'none' | 'read' | 'write'>>({});
-  const allSourceIds = ['default', 'shared', 'customers', 'internal'];
 
-  const fetchRoles = async () => {
+  const fetchData = async () => {
+    setError('');
     try {
-      const data = await api.listRoles();
-      setRoles(data.roles || []);
-    } catch (e: any) { setError(e.message); }
+      const [rolesData, sourcesData] = await Promise.all([
+        api.listRoles(),
+        api.listSources(),
+      ]);
+      setRoles(rolesData.roles || []);
+      setSources(sourcesData.sources || []);
+    } catch (e: any) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+    }
     setLoading(false);
   };
 
-  useEffect(() => { fetchRoles(); }, []);
+  useEffect(() => { fetchData(); }, []);
 
   const selected = roles.find(r => r.id === selectedId);
 
   const handleSelect = (id: string) => {
     setSelectedId(id);
-    const r = roles.find(r => r.id === id);
+    const r = roles.find(ro => ro.id === id);
     if (!r) { setGrants({}); return; }
     const g: Record<string, 'none' | 'read' | 'write'> = {};
-    for (const sid of allSourceIds) {
-      g[sid] = r.sources[sid] || 'none';
+    for (const s of sources) {
+      g[s.id] = r.sources[s.id] || 'none';
     }
     setGrants(g);
   };
@@ -49,7 +62,7 @@ export function RolesPage() {
       .map(([sourceId, access]) => ({ sourceId, access: access as 'read' | 'write' }));
     try {
       await api.setRoleSources(selectedId, grantList);
-      fetchRoles();
+      fetchData();
     } catch (e: any) { setError(e.message); }
   };
 
@@ -58,7 +71,7 @@ export function RolesPage() {
     try {
       await api.createRole(newRoleId, newRoleDesc || undefined);
       setShowCreate(false); setNewRoleId(''); setNewRoleDesc('');
-      fetchRoles();
+      fetchData();
     } catch (e: any) { setError(e.message); }
   };
 
@@ -67,7 +80,7 @@ export function RolesPage() {
     try {
       await api.deleteRole(id);
       if (selectedId === id) setSelectedId(null);
-      fetchRoles();
+      fetchData();
     } catch (e: any) { setError(e.message); }
   };
 
@@ -79,43 +92,54 @@ export function RolesPage() {
     });
   };
 
-  axios: string; // prevent ts unused import warning
-
-  if (loading) return <div style={{ padding: 24 }}>Loading…</div>;
+  if (loading) return <div style={{ padding: 24, color: 'var(--text-secondary)' }}>Loading…</div>;
 
   return (
     <div style={{ padding: 24, display: 'flex', gap: 24 }}>
       {/* Left: role list */}
-      <div style={{ minWidth: 240 }}>
+      <div style={{ minWidth: 240, maxWidth: 280 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
           <h2 style={{ margin: 0 }}>Roles</h2>
-          <button onClick={() => setShowCreate(!showCreate)} style={{ padding: '6px 16px', background: '#111', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer', fontSize: 13 }}>
+          <button className="btn btn-secondary"
+            onClick={() => setShowCreate(!showCreate)}
+            style={{ fontSize: 13, padding: '4px 12px' }}>
             {showCreate ? 'Cancel' : '+ New'}
           </button>
         </div>
 
-        {error && <div style={{ background: '#fef2f2', color: '#991b1b', padding: '8px 12px', borderRadius: 6, marginBottom: 12, fontSize: 13 }}>{error}</div>}
+        {error && <div style={{ background: 'var(--error)', color: '#fff', padding: '8px 12px', borderRadius: 6, marginBottom: 12, fontSize: 13 }}>{error}</div>}
 
         {showCreate && (
-          <form onSubmit={handleCreate} style={{ marginBottom: 12, background: '#f9fafb', padding: 12, borderRadius: 6 }}>
-            <input placeholder="Role ID" value={newRoleId} onChange={e => setNewRoleId(e.target.value)} required style={{ width: '100%', marginBottom: 6, padding: '6px 8px', borderRadius: 4, border: '1px solid #d1d5db', fontSize: 13, boxSizing: 'border-box' }} />
-            <input placeholder="Description" value={newRoleDesc} onChange={e => setNewRoleDesc(e.target.value)} style={{ width: '100%', marginBottom: 6, padding: '6px 8px', borderRadius: 4, border: '1px solid #d1d5db', fontSize: 13, boxSizing: 'border-box' }} />
-            <button type="submit" style={{ padding: '6px 16px', background: '#111', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer', fontSize: 13 }}>Create</button>
+          <form onSubmit={handleCreate} style={{ marginBottom: 12, background: 'var(--bg-secondary)', padding: 12, borderRadius: 6, border: '1px solid var(--border)' }}>
+            <input placeholder="Role ID (e.g. sales)" value={newRoleId} onChange={e => setNewRoleId(e.target.value)} required
+              style={{ width: '100%', marginBottom: 6, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--border)', fontSize: 13, boxSizing: 'border-box', background: 'var(--bg-primary)', color: 'var(--text-primary)' }} />
+            <input placeholder="Description (optional)" value={newRoleDesc} onChange={e => setNewRoleDesc(e.target.value)}
+              style={{ width: '100%', marginBottom: 8, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--border)', fontSize: 13, boxSizing: 'border-box', background: 'var(--bg-primary)', color: 'var(--text-primary)' }} />
+            <button type="submit" className="btn btn-primary" style={{ fontSize: 13, padding: '4px 14px' }}>Create</button>
           </form>
         )}
 
-        {roles.map(r => (
-          <div key={r.id}
-            onClick={() => handleSelect(r.id)}
-            style={{
-              padding: '10px 12px', cursor: 'pointer', borderRadius: 6, marginBottom: 4,
-              background: selectedId === r.id ? '#eff6ff' : 'transparent',
-              border: selectedId === r.id ? '1px solid #3b82f6' : '1px solid transparent',
-            }}>
-            <div style={{ fontWeight: 500, fontSize: 14 }}>{r.id}</div>
-            <div style={{ fontSize: 12, color: '#6b7280' }}>{r.description || ''} · {r.memberCount} members</div>
+        {roles.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: 32, color: 'var(--text-muted)', fontSize: 13 }}>
+            No roles yet. Create one to get started.
           </div>
-        ))}
+        ) : (
+          roles.map(r => (
+            <div key={r.id}
+              onClick={() => handleSelect(r.id)}
+              style={{
+                padding: '10px 12px', cursor: 'pointer', borderRadius: 6, marginBottom: 4,
+                background: selectedId === r.id ? 'var(--accent)' : 'transparent',
+                border: selectedId === r.id ? '1px solid var(--accent)' : '1px solid transparent',
+                color: selectedId === r.id ? '#fff' : 'var(--text-primary)',
+              }}>
+              <div style={{ fontWeight: 500, fontSize: 14 }}>{r.id}</div>
+              <div style={{ fontSize: 12, opacity: selectedId === r.id ? 0.8 : 0.7 }}>
+                {r.description || ''}{r.description ? ' · ' : ''}{r.memberCount} member{r.memberCount !== 1 ? 's' : ''}
+              </div>
+            </div>
+          ))
+        )}
       </div>
 
       {/* Right: source matrix */}
@@ -125,45 +149,59 @@ export function RolesPage() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
               <h3 style={{ margin: 0 }}>{selected.id}</h3>
               <button onClick={() => handleDelete(selected.id)}
-                style={{ padding: '4px 10px', fontSize: 12, borderRadius: 4, border: '1px solid #ef4444', color: '#dc2626', cursor: 'pointer', background: '#fff' }}>
+                style={{ padding: '4px 10px', fontSize: 12, borderRadius: 4, border: '1px solid var(--error)', color: 'var(--error)', cursor: 'pointer', background: 'transparent' }}>
                 Delete
               </button>
             </div>
-            <p style={{ color: '#6b7280', fontSize: 13, marginBottom: 16 }}>{selected.description || 'No description'} · {selected.memberCount} members</p>
+            <p style={{ color: 'var(--text-secondary)', fontSize: 13, marginBottom: 16 }}>
+              {selected.description || 'No description'} · {selected.memberCount} member{selected.memberCount !== 1 ? 's' : ''}
+            </p>
 
-            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-              <thead>
-                <tr style={{ borderBottom: '2px solid #e5e7eb', textAlign: 'left' }}>
-                  <th style={{ padding: '8px 12px' }}>Source</th>
-                  <th style={{ padding: '8px 12px' }}>Access</th>
-                </tr>
-              </thead>
-              <tbody>
-                {allSourceIds.map(sid => (
-                  <tr key={sid} style={{ borderBottom: '1px solid #f3f4f6' }}>
-                    <td style={{ padding: '8px 12px', fontWeight: 500 }}>{sid}</td>
-                    <td style={{ padding: '8px 12px' }}>
-                      <button onClick={() => cycleAccess(sid)}
-                        style={{
-                          padding: '4px 12px', fontSize: 12, borderRadius: 4, cursor: 'pointer', border: '1px solid #d1d5db',
-                          background: grants[sid] === 'write' ? '#059669' : grants[sid] === 'read' ? '#3b82f6' : '#f3f4f6',
-                          color: grants[sid] !== 'none' ? '#fff' : '#374151',
-                        }}>
-                        {grants[sid] || 'none'}
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            {sources.length === 0 ? (
+              <div style={{ color: 'var(--text-muted)', padding: 20, textAlign: 'center' }}>
+                No sources configured. Add sources before assigning permissions.
+              </div>
+            ) : (
+              <>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '2px solid var(--border)', textAlign: 'left' }}>
+                      <th style={{ padding: '8px 12px', color: 'var(--text-secondary)', fontSize: 12, fontWeight: 600 }}>Source</th>
+                      <th style={{ padding: '8px 12px', color: 'var(--text-secondary)', fontSize: 12, fontWeight: 600 }}>Access</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sources.map(s => (
+                      <tr key={s.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                        <td style={{ padding: '8px 12px', fontWeight: 500 }}>{s.name || s.id}</td>
+                        <td style={{ padding: '8px 12px' }}>
+                          <button onClick={() => cycleAccess(s.id)}
+                            className={`badge ${grants[s.id] === 'write' ? 'badge-write' : grants[s.id] === 'read' ? 'badge-read' : ''}`}
+                            style={{
+                              padding: '4px 12px', fontSize: 12, borderRadius: 4, cursor: 'pointer', border: '1px solid var(--border)',
+                              background: grants[s.id] === 'write' ? 'var(--success)' : grants[s.id] === 'read' ? 'var(--accent)' : 'var(--bg-secondary)',
+                              color: grants[s.id] !== 'none' ? '#fff' : 'var(--text-secondary)',
+                            }}>
+                            {grants[s.id] || 'none'}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
 
-            <button onClick={handleSaveGrants}
-              style={{ marginTop: 16, padding: '8px 20px', background: '#111', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer', fontSize: 14 }}>
-              Save Permissions
-            </button>
+                <button onClick={handleSaveGrants}
+                  className="btn btn-primary"
+                  style={{ marginTop: 16 }}>
+                  Save Permissions
+                </button>
+              </>
+            )}
           </div>
         ) : (
-          <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Select a role to edit its permissions</div>
+          <div style={{ color: 'var(--text-muted)', padding: 40, textAlign: 'center' }}>
+            Select a role to edit its permissions
+          </div>
         )}
       </div>
     </div>

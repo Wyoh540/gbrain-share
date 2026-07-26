@@ -178,64 +178,138 @@ You should be able to hit `https://brain.acme-co.com/health` and get `{"status":
 
 ---
 
-## Part 5: Register one OAuth client per teammate
+## Part 5: Create users and roles with per-source permissions
 
-Each teammate (or each AI agent for a teammate) gets their own OAuth client. The client controls what they can write and what they can read.
+GBrain's OAuth 2.1 server now supports human users who log in with a username and password. You create users and roles through the admin dashboard API, then teammates sign in through the browser to get scoped tokens that carry their role-union permissions. Machine clients (for crons and automation) still work alongside humans — keep reading for those.
+
+### Create the users
+
+Human users log in with a username and password. Create them through the admin API (the same server you started in Part 4):
 
 ```bash
-# Alice (sales): writes customers/alice-example, reads customers + shared
-gbrain auth register-client alice-example \
-  --grant-types client_credentials \
-  --scopes read,write \
-  --source customers \
-  --federated-read customers,shared
+# Alice (on the sales team)
+curl -X POST https://brain.acme-co.com/admin/api/users \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"username": "alice-example", "password": "alices-password-here"}'
 
-# Bob (ops): writes internal/bob-example, reads internal + shared
-gbrain auth register-client bob-example \
-  --grant-types client_credentials \
-  --scopes read,write \
-  --source internal \
-  --federated-read internal,shared
-
-# Carol (legal): writes shared/legal, reads all three
-gbrain auth register-client carol-example \
-  --grant-types client_credentials \
-  --scopes read,write \
-  --source shared \
-  --federated-read shared,customers,internal
+# Bob (on the ops team)
+curl -X POST https://brain.acme-co.com/admin/api/users \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"username": "bob-example", "password": "bobs-password-here"}'
 ```
 
-Each `register-client` command prints a `client_id` and a `client_secret`. Save both for each teammate. They go into the teammate's local agent config.
+Each call returns a user object with an `id`. Save those IDs — you'll use them in a moment to assign roles.
 
-A note on the flags:
+### Create roles with per-source permissions
 
-- `--scopes read,write` lets the client query the brain and write new pages. You can omit `write` for read-only clients (executive summaries, dashboards). The `admin` scope is needed for operational commands like `gbrain remote doctor` and is usually reserved for your own admin client.
-- `--source` controls write authority. A client can only write to one source. Within that source, your folder convention from Part 3 keeps each person's writes in their own subfolder.
-- `--federated-read` controls read scope. A client can read from one or more sources.
+A role declares which sources a holder can read and write. Create two roles, one per team:
+
+```bash
+# sales role: can write to customers, can read customers + shared
+curl -X POST https://brain.acme-co.com/admin/api/roles \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"name": "sales", "description": "Sales team — customer data + shared knowledge"}'
+
+ROLE_SALES_ID=<copy the id from the response>
+
+curl -X POST https://brain.acme-co.com/admin/api/roles/$ROLE_SALES_ID/sources \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"source": "customers", "access": "write"}'
+
+curl -X POST https://brain.acme-co.com/admin/api/roles/$ROLE_SALES_ID/sources \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"source": "shared", "access": "read"}'
+```
+
+```bash
+# ops role: can write to internal, can read internal + shared
+curl -X POST https://brain.acme-co.com/admin/api/roles \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"name": "ops", "description": "Ops team — internal data + shared knowledge"}'
+
+ROLE_OPS_ID=<copy the id from the response>
+
+curl -X POST https://brain.acme-co.com/admin/api/roles/$ROLE_OPS_ID/sources \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"source": "internal", "access": "write"}'
+
+curl -X POST https://brain.acme-co.com/admin/api/roles/$ROLE_OPS_ID/sources \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"source": "shared", "access": "read"}'
+```
+
+### Assign roles to users
+
+Now wire the roles to the users you created:
+
+```bash
+# Alice gets the sales role
+curl -X POST https://brain.acme-co.com/admin/api/users/$ALICE_USER_ID/roles \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"role_id": "'$ROLE_SALES_ID'"}'
+
+# Bob gets the ops role
+curl -X POST https://brain.acme-co.com/admin/api/users/$BOB_USER_ID/roles \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"role_id": "'$ROLE_OPS_ID'"}'
+```
+
+A user can hold multiple roles — their effective permissions are the union of every role they have. If a user later joins the sales team on top of ops, just assign the sales role and they'll see both `customers` and `internal`.
+
+### Users log in through the browser
+
+Teammates open their browser and go to `https://brain.acme-co.com/authorize`. They enter their username and password, and the authorization server returns an OAuth 2.1 token scoped to their role-union permissions. Hand each teammate these three pieces:
+
+- The brain's public URL: `https://brain.acme-co.com`
+- Their username (e.g. `alice-example`)
+- Their password
+
+They log in once, copy the token, and configure it in their local agent. No `client_id` or `client_secret` to manage — the token carries everything the server needs to enforce scope.
+
+### Machine clients still work for crons
+
+`client_credentials` grant clients (the `gbrain auth register-client` flow from the original Part 5) are still supported and are the right fit for non-interactive workloads. Use them for:
+
+- Nightly cron jobs (`gbrain agent run` on a schedule)
+- CI/CD pipelines that push build summaries into the brain
+- Dashboard read-only tokens published to a monitoring service
+
+Register them the same way as before — they get a `client_id` and `client_secret` — but for human teammates creating and querying pages interactively, username+password login through the browser is the simpler path. Both token types coexist; the server enforces the same per-source read/write rules regardless of how the token was obtained.
 
 ### Verify the scoping actually scopes
 
-Before you hand the brain to teammates, verify isolation. Two terminal windows on your local machine using each client's credentials:
+Before you hand the brain to teammates, verify isolation. Log each user in and query across the sources:
 
 ```bash
-# Terminal 1, as Alice
-export GBRAIN_REMOTE_CLIENT_ID=<Alice's client_id>
-export GBRAIN_REMOTE_CLIENT_SECRET=<Alice's client_secret>
+# Terminal 1: Alice logs in, gets her token, searches
+export GBRAIN_REMOTE_TOKEN=<Alice's OAuth token>
 export GBRAIN_REMOTE_MCP_URL=https://brain.acme-co.com/mcp
 
 gbrain search "performance review" --remote
 ```
 
-Alice should see results only from `customers` and `shared`. The performance-review notes live in `internal`, which she's not scoped to read. She shouldn't see them.
+Alice holds the `sales` role (write `customers`, read `shared`). She should see customer notes and shared-team pages, but the performance-review notes live in `internal` — she's not scoped there, so they won't appear.
 
 ```bash
-# Terminal 2, as Bob (export his credentials similarly)
+# Terminal 2: Bob logs in, gets his token, searches
+export GBRAIN_REMOTE_TOKEN=<Bob's OAuth token>
+
 gbrain search "performance review" --remote
 ```
 
-Bob should see the performance-review notes from `internal`, plus anything related from `shared`. He shouldn't see anything that lives only in `customers`.
+Bob holds the `ops` role (write `internal`, read `shared`). He sees the performance-review notes from `internal`, plus anything relevant from `shared`. He doesn't see data that lives only in `customers`.
 
-If both queries return correctly scoped results, isolation is working.
+If both queries return correctly scoped results and neither user sees the other's exclusive data, isolation is working. You can now hand the brain to the team.
 
 ---
 
