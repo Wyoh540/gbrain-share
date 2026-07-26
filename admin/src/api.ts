@@ -34,8 +34,9 @@ async function apiFetchText(path: string) {
 }
 
 export const api = {
-  login: (token: string, username?: string, password?: string) => {
-    const body: Record<string, string> = { token };
+  login: (token?: string, username?: string, password?: string) => {
+    const body: Record<string, string> = {};
+    if (token) body.token = token;
     if (username && password) { body.username = username; body.password = password; }
     return apiFetch('/admin/login', { method: 'POST', body: JSON.stringify(body) });
   },
@@ -56,6 +57,7 @@ export const api = {
   // v0.41 D2 — live minion-jobs dashboard snapshot.
   jobsWatch: () => apiFetch('/admin/api/jobs/watch'),
   // Multi-user auth — users & roles management
+  listSources: () => apiFetch('/admin/api/sources'),
   listUsers: () => apiFetch('/admin/api/users'),
   createUser: (username: string, password: string, displayName?: string, email?: string, isAdmin?: boolean) =>
     apiFetch('/admin/api/users', { method: 'POST', body: JSON.stringify({ username, password, display_name: displayName, email, is_admin: isAdmin }) }),
@@ -72,4 +74,11 @@ export const api = {
     apiFetch(`/admin/api/roles/${encodeURIComponent(roleId)}/sources`, { method: 'POST', body: JSON.stringify({ grants }) }),
   deleteRole: (roleId: string) =>
     apiFetch(`/admin/api/roles/${encodeURIComponent(roleId)}`, { method: 'DELETE' }),
+  signOutEverywhere: () => apiFetch('/admin/api/sign-out-everywhere', { method: 'POST' }),
+  // v0.42: User self-service console (/admin/api/me — requireAuth, NOT requireAdmin)
+  me: () => apiFetch('/admin/api/me'),
+  meSources: () => apiFetch('/admin/api/me/sources'),
+  meApiKeys: () => apiFetch('/admin/api/me/api-keys'),
+  meCreateApiKey: (name: string) => apiFetch('/admin/api/me/api-keys', { method: 'POST', body: JSON.stringify({ name }) }),
+  meRevokeApiKey: (name: string) => apiFetch('/admin/api/me/api-keys/revoke', { method: 'POST', body: JSON.stringify({ name }) }),
 };

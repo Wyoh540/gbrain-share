@@ -15,8 +15,8 @@
  *                  [--timeout-ms N]
  *
  * Auth:
- *   - Bearer (default): a `gbrain auth create` token. Simple; long-lived +
- *     full-access. Best for local/personal use.
+ *   - Bearer (default): a `gbrain auth create` token (or --api-key). Simple;
+ *     long-lived + full-access. Best for local/personal use.
  *   - OAuth 2.1 client credentials (`--oauth`, perplexity/generic only): the
  *     correct path for anything exposed to a third-party cloud — least-privilege
  *     scopes + short-lived rotating access tokens. The connector is given an
@@ -108,7 +108,7 @@ Auth:
                                  anything exposed to a third-party cloud
 
 Flags:
-  --token <bearer>     Bearer token (else $${ENV_VAR}; from 'gbrain auth create')
+  --token <bearer>     Bearer token (alias: --api-key; else $${ENV_VAR} or $GBRAIN_API_KEY)
   --name <id>          MCP server name in the agent (default: ${DEFAULT_NAME})
   --agent <kind>       claude-code (default) | codex | perplexity | generic
   --oauth              Use OAuth client credentials instead of a bearer token
@@ -251,7 +251,7 @@ export function resolveToken(opts: { tokenFlag?: string | null; env?: string | n
   if (opts.mode === 'print') return { kind: 'placeholder' };
   return {
     kind: 'error',
-    error: `No token. Pass --token <bearer> or set ${ENV_VAR}. Create one on the host with: gbrain auth create "<name>"`,
+    error: `No token. Pass --token <bearer> or set ${ENV_VAR} / GBRAIN_API_KEY. Create one on the host with: gbrain auth create "<name>"`,
   };
 }
 
@@ -592,7 +592,7 @@ function parseArgs(args: string[]): ParsedFlags {
       case '--force': out.force = true; break;
       case '--json': out.json = true; break;
       case '--show-token': out.showToken = true; break;
-      case '--token': { const v = takeValue('--token'); if (v !== undefined) out.token = v; break; }
+      case '--token': case '--api-key': { const v = takeValue(a); if (v !== undefined) out.token = v; break; }
       case '--client-id': { const v = takeValue('--client-id'); if (v !== undefined) out.clientId = v; break; }
       case '--client-secret': { const v = takeValue('--client-secret'); if (v !== undefined) out.clientSecret = v; break; }
       case '--scopes': { const v = takeValue('--scopes'); if (v !== undefined) out.scopes = v; break; }
@@ -684,7 +684,11 @@ export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps
   }
 
   const mode = f.install ? 'install' : 'print';
-  const tok = resolveToken({ tokenFlag: f.token ?? null, env: deps.env(ENV_VAR) ?? null, mode });
+  const tok = resolveToken({
+    tokenFlag: f.token ?? null,
+    env: deps.env(ENV_VAR) ?? deps.env('GBRAIN_API_KEY') ?? null,
+    mode,
+  });
   if (tok.kind === 'error') fail(tok.error);
   const token: string | null = tok.kind === 'literal' ? tok.token : null;
 

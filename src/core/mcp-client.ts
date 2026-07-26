@@ -2,20 +2,29 @@
  * Outbound HTTP MCP client for thin-client mode (multi-topology v1, Tier B).
  *
  * Wraps the official @modelcontextprotocol/sdk Client + StreamableHTTPClientTransport
- * with OAuth `client_credentials` minting + token caching + 401 retry. Used by:
+ * with two auth modes:
+ *
+ *   1. API key (simple): set GBRAIN_API_KEY env var or config.remote_mcp.api_key.
+ *      Key is sent directly as `Authorization: Bearer <key>` — no OAuth discovery,
+ *      no token exchange, no caching. The server's http-transport.ts already
+ *      validates raw Bearer tokens against the access_tokens table.
+ *   2. OAuth `client_credentials` (full): mint + cache + 401-retry. Used when
+ *      no API key is present. Requires issuer_url, oauth_client_id, and
+ *      oauth_client_secret in remote_mcp config.
+ *
+ * Used by:
  *   - `gbrain remote ping`   — submits autopilot-cycle, polls get_job
  *   - `gbrain remote doctor` — calls run_doctor MCP op
  *
- * Token caching strategy: in-process Map keyed by mcp_url, value carries the
- * access_token + expires_at. CLI invocations are short-lived; the cache
- * amortizes when a single `gbrain remote ping` makes multiple calls (submit_job
- * + N × get_job). Persisting to disk would create a credential-on-disk
- * surface for marginal benefit — re-mint is a single sub-100ms /token call.
+ * Token caching strategy (OAuth mode): in-process Map keyed by mcp_url, value
+ * carries the access_token + expires_at. CLI invocations are short-lived; the
+ * cache amortizes when a single `gbrain remote ping` makes multiple calls
+ * (submit_job + N × get_job). Persisting to disk would create a credential-on-
+ * disk surface for marginal benefit — re-mint is a single sub-100ms /token call.
  *
- * 401 handling: on a tool-call rejection, drop the cached token, mint fresh
- * once, retry the call. If the second attempt also 401s, surface a structured
- * error with the mcp_url + suggested remedy. Auth-failure-after-refresh is the
- * canonical "client credentials revoked or scope insufficient" signal.
+ * 401 handling: on a tool-call rejection in OAuth mode, drop the cached token,
+ * mint fresh once, retry the call. In API key mode, 401 means the key is
+ * invalid/revoked — fail immediately with a clear remedy hint.
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -164,10 +173,57 @@ function resolveSecret(remote: NonNullable<GBrainConfig['remote_mcp']>): string 
 }
 
 /**
- * Mint or reuse a cached access_token for the given config. Throws
- * RemoteMcpError on discovery failure or auth rejection.
+ * Check whether API key mode is active. When true, skip OAuth entirely and
+ * use the key directly as a Bearer token. The server's http-transport.ts
+ * already validates raw Bearer tokens against the access_tokens table.
+ */
+export function isApiKeyMode(config: GBrainConfig | null): boolean {
+  if (process.env.GBRAIN_API_KEY) return true;
+  return !!(config?.remote_mcp?.api_key);
+}
+
+/**
+ * Resolve the API key from env var (preferred) or config file.
+ * Returns null when not in API key mode — caller must fall through to OAuth.
+ */
+function resolveApiKey(config: GBrainConfig | null): string | null {
+  const envKey = process.env.GBRAIN_API_KEY;
+  if (envKey) return envKey;
+  return config?.remote_mcp?.api_key ?? null;
+}
+
+/**
+ * Resolve MCP URL from config. Lighter than requireRemoteMcp — only needs
+ * mcp_url, not the full OAuth config. Used by callers that don't need OAuth.
+ */
+export function resolveMcpUrl(config: GBrainConfig | null): string {
+  if (!config?.remote_mcp?.mcp_url) {
+    throw new RemoteMcpError(
+      'config',
+      'No remote_mcp.mcp_url configured. Run `gbrain init --mcp-only` first.',
+    );
+  }
+  return config.remote_mcp.mcp_url;
+}
+
+/**
+ * Mint or reuse a cached access_token for the given config. In API key mode,
+ * returns the key directly (no OAuth). Otherwise performs OAuth discovery +
+ * client_credentials token exchange. Throws RemoteMcpError on failure.
  */
 async function getAccessToken(config: GBrainConfig, force = false): Promise<string> {
+  // API key mode: use the key directly — no OAuth, no caching.
+  if (isApiKeyMode(config)) {
+    const key = resolveApiKey(config);
+    if (!key) {
+      throw new RemoteMcpError(
+        'config',
+        'API key mode is active (GBRAIN_API_KEY set or config has api_key) but key resolved to empty. Check your env var / config.',
+      );
+    }
+    return key;
+  }
+
   const remote = requireRemoteMcp(config);
   const cached = tokenCache.get(remote.mcp_url);
   if (!force && cached && cached.expires_at_ms > Date.now()) {
@@ -270,13 +326,21 @@ export function buildAbortController(opts: CallRemoteToolOptions): { signal: Abo
 }
 
 /**
- * Call an MCP tool on the remote server. Handles auth refresh on 401 once.
+ * Call an MCP tool on the remote server.
+ *
+ * In API key mode (GBRAIN_API_KEY set), sends the key directly as a Bearer
+ * token — no OAuth, no caching, no 401 retry.
+ *
+ * In OAuth mode, mints (or reuses cached) access_token, handles 401 with one
+ * retry after cache eviction, and normalizes all errors through toRemoteMcpError.
+ *
  * Returns the parsed `result` payload from the tool response.
  *
  * Throws RemoteMcpError on:
  *   - missing remote_mcp config
- *   - OAuth discovery / token failures
- *   - 401 after refresh attempt (auth_after_refresh)
+ *   - OAuth discovery / token failures (OAuth mode)
+ *   - invalid API key (API key mode)
+ *   - 401 after OAuth refresh attempt (auth_after_refresh)
  *   - tool-call errors (tool_error)
  *   - network errors
  */
@@ -334,7 +398,17 @@ export async function callRemoteTool(
       const message = e instanceof Error ? e.message : String(e);
       const looksLike401 = /401|unauthor|invalid.token/i.test(message);
       if (!looksLike401) throw e;
-      // Drop cached token and retry once with a fresh mint.
+
+      // API key mode: no refresh possible. Fail immediately with clear hint.
+      if (isApiKeyMode(config)) {
+        throw new RemoteMcpError(
+          'auth',
+          'API key rejected (401). Verify GBRAIN_API_KEY is valid and not revoked on the host. Create one: gbrain auth create <name>',
+          { mcp_url: remote.mcp_url },
+        );
+      }
+
+      // OAuth: drop cached token and retry once with a fresh mint.
       tokenCache.delete(remote.mcp_url);
       let freshToken: string;
       try {

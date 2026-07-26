@@ -29,8 +29,9 @@ import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { RateLimiter } from '../mcp/rate-limit.ts';
-import { verifyUserPassword, createUser, listUsers, setUserPassword, disableUser, enableUser, assignUserRoles } from '../core/users.ts';
+import { verifyUserPassword, createUser, listUsers, setUserPassword, disableUser, enableUser, assignUserRoles, getUserByUsername } from '../core/users.ts';
 import { listRoles, createRole as createRoleStore, setRoleSources, deleteRole as deleteRoleStore } from '../core/roles.ts';
+import { listSources } from '../core/sources-ops.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
@@ -570,7 +571,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     forcePrint: options.printAdminToken === true,
     isTty: process.stderr.isTTY === true,
   });
-  const adminSessions = new Map<string, number>(); // sessionId → expiresAt
+  interface SessionEntry {
+    expiresAt: number;
+    userId: string;
+    username: string;
+    isAdmin: boolean;
+  }
+  const adminSessions = new Map<string, SessionEntry>();
 
   // SSE clients for live activity feed
   const sseClients = new Set<express.Response>();
@@ -976,33 +983,36 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // POST /admin/login — JSON body with token (bootstrap) or username+password
   app.post('/admin/login', express.json(), async (req, res) => {
     const { token, username, password } = req.body || {};
+    let ses: SessionEntry;
 
-    // Bootstrap-token login (existing path)
+    // Bootstrap-token login (existing path) — admin without user linkage
     if (token && typeof token === 'string') {
       const tokenHash = createHash('sha256').update(token).digest('hex');
       if (!safeHexEqual(tokenHash, bootstrapHash)) {
         res.status(401).json({ error: 'Invalid token. Check your terminal output.' });
         return;
       }
+      ses = { userId: 'bootstrap', username: 'admin', isAdmin: true, expiresAt: 0 };
     } else if (username && typeof username === 'string' && password && typeof password === 'string') {
-      // Multi-user auth: username+password login (admin access required)
+      // Multi-user auth: username+password login (admin OR regular user)
       const adminSql = sqlQueryForEngine(engine as any);
       const user = await verifyUserPassword(adminSql, username, password);
-      if (!user || !user.isAdmin) {
-        res.status(401).json({ error: 'Invalid admin credentials' });
+      if (!user || user.status !== 'active') {
+        res.status(401).json({ error: 'Invalid credentials' });
         return;
       }
+      ses = { userId: user.id, username: user.username, isAdmin: user.isAdmin, expiresAt: 0 };
     } else {
       res.status(400).json({ error: 'Token or username+password required' });
       return;
     }
 
     const sessionId = randomBytes(32).toString('hex');
-    const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
-    adminSessions.set(sessionId, expiresAt);
+    ses.expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+    adminSessions.set(sessionId, ses);
 
     res.cookie('gbrain_admin', sessionId, adminCookie(req, 24 * 60 * 60 * 1000));
-    res.json({ status: 'authenticated' });
+    res.json({ status: 'authenticated', isAdmin: ses.isAdmin, username: ses.username });
   });
 
   // ---------------------------------------------------------------------------
@@ -1109,26 +1119,53 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     consumedNonces.add(nonce);
 
     const sessionId = randomBytes(32).toString('hex');
-    const sessionExpiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days for magic link
-    adminSessions.set(sessionId, sessionExpiresAt);
+    adminSessions.set(sessionId, {
+      userId: 'bootstrap',
+      username: 'admin',
+      isAdmin: true,
+      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+    });
 
     res.cookie('gbrain_admin', sessionId, adminCookie(req, 7 * 24 * 60 * 60 * 1000));
     res.redirect('/admin/');
   });
 
-  // Admin auth middleware
+  // Auth middleware — requires any valid session (admin or regular user).
+  // Sets req.sessionUser so downstream handlers can access user identity.
+  function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const sessionId = (req.cookies as Record<string, string>)?.gbrain_admin;
+    if (!sessionId || !adminSessions.has(sessionId)) {
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    }
+    const ses = adminSessions.get(sessionId)!;
+    if (Date.now() > ses.expiresAt) {
+      adminSessions.delete(sessionId);
+      res.status(401).json({ error: 'Session expired' });
+      return;
+    }
+    (req as any).sessionUser = ses;
+    next();
+  }
+
+  // Admin auth middleware — requires admin-privileged session.
   function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
     const sessionId = (req.cookies as Record<string, string>)?.gbrain_admin;
     if (!sessionId || !adminSessions.has(sessionId)) {
       res.status(401).json({ error: 'Admin authentication required' });
       return;
     }
-    const expiresAt = adminSessions.get(sessionId)!;
-    if (Date.now() > expiresAt) {
+    const ses = adminSessions.get(sessionId)!;
+    if (Date.now() > ses.expiresAt) {
       adminSessions.delete(sessionId);
       res.status(401).json({ error: 'Session expired' });
       return;
     }
+    if (!ses.isAdmin) {
+      res.status(403).json({ error: 'Admin access required' });
+      return;
+    }
+    (req as any).sessionUser = ses;
     next();
   }
 
@@ -1208,6 +1245,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       await assignUserRoles(adminSql, String(req.params.id), roles);
       res.json({ status: 'roles_updated' });
     } catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
+
+  // Sources API — list all sources for the admin SPA (Users/Roles/Sources pages
+  // need them for the source matrix, user-scope selectors, and sync status).
+  app.get('/admin/api/sources', requireAdmin, async (_req, res) => {
+    try {
+      const sources = await listSources(engine as any);
+      res.json({ sources });
+    } catch (err: any) { res.status(500).json({ error: err.message }); }
   });
 
   // Roles API — requires admin session
@@ -1596,6 +1642,155 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const { name } = req.body;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
       await sql`UPDATE access_tokens SET revoked_at = now() WHERE name = ${name} AND revoked_at IS NULL`;
+      res.json({ revoked: true });
+    } catch (e) {
+      res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // User self-service console endpoints (/admin/api/me)
+  // Require a valid session (requireAuth), NOT admin (requireAdmin).
+  // Regular users can view their own profile, API keys, and sources.
+  // ═══════════════════════════════════════════════════════════════════
+
+  // GET /admin/api/me — current user's profile + effective permissions
+  app.get('/admin/api/me', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const ses = (req as any).sessionUser as SessionEntry;
+      if (ses.userId === 'bootstrap') {
+        res.json({ username: 'admin', isAdmin: true, isBootstrap: true, readSources: [], writeSources: [], roles: [] });
+        return;
+      }
+      const user = await getUserByUsername(sql, ses.username);
+      if (!user) { res.status(404).json({ error: 'User not found' }); return; }
+
+      // Fetch assigned role names
+      const roleRows = await sql`
+        SELECT r.id, r.description FROM roles r
+        JOIN user_roles ur ON ur.role_id = r.id
+        WHERE ur.user_id = ${user.id}
+        ORDER BY r.id
+      `;
+      const roles = (roleRows as Array<{ id: string; description?: string | null }>).map(r => ({
+        id: r.id,
+        description: r.description ?? null,
+      }));
+
+      // Direct SQL: effective source permissions via role chain
+      const permRows = await sql`
+        SELECT DISTINCT rsp.source_id, rsp.access
+        FROM user_roles ur
+        JOIN role_source_permissions rsp ON rsp.role_id = ur.role_id
+        WHERE ur.user_id = ${user.id}
+      ` as Array<{ source_id: string; access: string }>;
+
+      const readSources = [...new Set(permRows.filter(r => r.access === 'read' || r.access === 'write').map(r => r.source_id))];
+      const writeSources = [...new Set(permRows.filter(r => r.access === 'write').map(r => r.source_id))];
+
+      res.json({
+        id: user.id,
+        username: user.username,
+        displayName: user.displayName ?? null,
+        email: user.email ?? null,
+        isAdmin: user.isAdmin,
+        status: user.status,
+        roles,
+        readSources,
+        writeSources,
+      });
+    } catch (e) {
+      res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to fetch profile' });
+    }
+  });
+
+  // GET /admin/api/me/sources — data sources the current user can access
+  app.get('/admin/api/me/sources', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const ses = (req as any).sessionUser as SessionEntry;
+      if (ses.userId === 'bootstrap') {
+        // Bootstrap admin — list all sources
+        const allSources = await listSources(engine as any);
+        res.json(allSources);
+        return;
+      }
+
+      // Step 1: get permitted source_ids via role chain
+      const permRows = await sql`
+        SELECT DISTINCT rsp.source_id
+        FROM user_roles ur
+        JOIN role_source_permissions rsp ON rsp.role_id = ur.role_id
+        WHERE ur.user_id = ${ses.userId}
+          AND rsp.access IN ('read', 'write')
+      ` as Array<{ source_id: string }>;
+      const permitted = new Set(permRows.map(r => r.source_id));
+      if (permitted.size === 0) {
+        res.json([]);
+        return;
+      }
+
+      // Step 2: get full source info via listSources, filter to permitted
+      const allSources = await listSources(engine as any);
+      res.json(allSources.filter(s => permitted.has(s.id)));
+    } catch (e) {
+      res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to fetch sources' });
+    }
+  });
+
+  // GET /admin/api/me/api-keys — list current user's own API keys
+  app.get('/admin/api/me/api-keys', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const ses = (req as any).sessionUser as SessionEntry;
+      const keys = await sql`
+        SELECT id, name, created_at, last_used_at,
+          CASE WHEN revoked_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status
+        FROM access_tokens
+        WHERE permissions->>'created_by_user_id' = ${ses.userId}
+        ORDER BY created_at DESC
+      `;
+      res.json(keys);
+    } catch (e) {
+      res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to list API keys' });
+    }
+  });
+
+  // POST /admin/api/me/api-keys — create a new API key for current user
+  app.post('/admin/api/me/api-keys', requireAuth, express.json(), async (req: Request, res: Response) => {
+    try {
+      const ses = (req as any).sessionUser as SessionEntry;
+      if (ses.userId === 'bootstrap') {
+        res.status(400).json({ error: 'Bootstrap admin cannot create user-scoped API keys. Use /admin/api/api-keys instead.' });
+        return;
+      }
+      const { name } = req.body;
+      if (!name || typeof name !== 'string') { res.status(400).json({ error: 'Name required' }); return; }
+      const { generateToken, hashToken } = await import('../core/utils.ts');
+      const token = generateToken('gbrain_');
+      const hash = hashToken(token);
+      const id = (await import('crypto')).randomUUID();
+      await sql`INSERT INTO access_tokens (id, name, token_hash, permissions) VALUES (${id}, ${name}, ${hash}, ${JSON.stringify({ created_by_user_id: ses.userId, created_by_username: ses.username })})`;
+      res.json({ name, token, id });
+    } catch (e) {
+      res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to create API key' });
+    }
+  });
+
+  // POST /admin/api/me/api-keys/revoke — revoke current user's API key
+  app.post('/admin/api/me/api-keys/revoke', requireAuth, express.json(), async (req: Request, res: Response) => {
+    try {
+      const ses = (req as any).sessionUser as SessionEntry;
+      if (ses.userId === 'bootstrap') {
+        res.status(400).json({ error: 'Bootstrap admin cannot revoke user-scoped API keys via this endpoint.' });
+        return;
+      }
+      const { name } = req.body;
+      if (!name || typeof name !== 'string') { res.status(400).json({ error: 'Name required' }); return; }
+      const result = await sql`
+        UPDATE access_tokens SET revoked_at = now()
+        WHERE name = ${name}
+          AND permissions->>'created_by_user_id' = ${ses.userId}
+          AND revoked_at IS NULL
+      `;
       res.json({ revoked: true });
     } catch (e) {
       res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
@@ -2489,7 +2684,7 @@ ${bootstrapFromEnv
   ? '║  Admin Token: from $GBRAIN_ADMIN_BOOTSTRAP_TOKEN     ║\n╚══════════════════════════════════════════════════════╝'
   : suppressBootstrapPrint
     ? '║  Admin Token: hidden (non-TTY log-leak guard)        ║\n║  set $GBRAIN_ADMIN_BOOTSTRAP_TOKEN, or pass          ║\n║  --print-admin-token on a trusted terminal.          ║\n╚══════════════════════════════════════════════════════╝'
-    : `║  Admin Token (paste into /admin login):              ║\n║  ${bootstrapToken.substring(0, 50)}  ║\n║  ${bootstrapToken.substring(50).padEnd(50)}  ║\n╚══════════════════════════════════════════════════════╝`}
+    : `║  Admin Token (paste into /admin login):              ║\n║  ${bootstrapToken}${' '.repeat(Math.max(1, 52 - bootstrapToken.length))}║\n╚══════════════════════════════════════════════════════╝`}
 `);
   });
 }

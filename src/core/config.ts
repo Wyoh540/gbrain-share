@@ -301,6 +301,15 @@ export interface GBrainConfig {
     mcp_url: string;
     oauth_client_id: string;
     oauth_client_secret?: string;
+    /**
+     * v0.42: API key for simple auth mode. When set (or GBRAIN_API_KEY env var
+     * is present), the thin-client skips OAuth discovery + token exchange and
+     * sends the key directly as `Authorization: Bearer <key>`. The server's
+     * http-transport.ts already validates raw Bearer tokens against the
+     * access_tokens table. Mutually exclusive with OAuth — API key takes
+     * precedence when both are configured.
+     */
+    api_key?: string;
   };
 
   /**
@@ -566,6 +575,10 @@ export function loadConfig(): GBrainConfig | null {
       : {}),
     ...(process.env.GBRAIN_REMOTE_CLIENT_SECRET && fileConfig?.remote_mcp
       ? { remote_mcp: { ...fileConfig.remote_mcp, oauth_client_secret: process.env.GBRAIN_REMOTE_CLIENT_SECRET } }
+      : {}),
+    // API key env var overrides the config file value (same precedence as oauth_client_secret).
+    ...(process.env.GBRAIN_API_KEY && fileConfig?.remote_mcp
+      ? { remote_mcp: { ...fileConfig.remote_mcp, api_key: process.env.GBRAIN_API_KEY } }
       : {}),
   };
 

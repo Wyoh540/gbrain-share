@@ -14,7 +14,7 @@
 
 import type { GBrainConfig } from './config.ts';
 import { discoverOAuth, mintClientCredentialsToken, smokeTestMcp } from './remote-mcp-probe.ts';
-import { callRemoteTool, RemoteMcpError, unpackToolResult } from './mcp-client.ts';
+import { callRemoteTool, RemoteMcpError, unpackToolResult, isApiKeyMode } from './mcp-client.ts';
 import { safeCompare, driftLevel, loadPromptState } from './thin-client-upgrade-prompt.ts';
 import { VERSION } from '../version.ts';
 
@@ -28,6 +28,8 @@ export interface RemoteCheck {
 export interface RemoteDoctorReport {
   schema_version: 2;
   mode: 'thin-client';
+  /** v0.42: which auth mode was used (api_key skips OAuth). */
+  auth_mode: 'api_key' | 'oauth';
   status: 'ok' | 'warn' | 'fail';
   mcp_url: string;
   issuer_url: string;
@@ -94,6 +96,7 @@ export async function collectRemoteDoctorReport(
     return {
       schema_version: 2,
       mode: 'thin-client',
+      auth_mode: 'oauth',
       status: 'fail',
       mcp_url: '',
       issuer_url: '',
@@ -104,7 +107,22 @@ export async function collectRemoteDoctorReport(
 
   const issuerOk = /^https?:\/\//i.test(remote.issuer_url);
   const mcpOk = /^https?:\/\//i.test(remote.mcp_url);
-  if (!issuerOk || !mcpOk) {
+  const apiKeyMode = isApiKeyMode(config);
+  const skipProbe = opts.skipScopeProbe || process.env.GBRAIN_DOCTOR_SKIP_SCOPE_PROBE === '1';
+
+  if (!mcpOk) {
+    checks.push({
+      name: 'config_integrity',
+      status: 'fail',
+      message: `mcp_url malformed: ${remote.mcp_url}`,
+    });
+  } else if (apiKeyMode) {
+    checks.push({
+      name: 'config_integrity',
+      status: 'ok',
+      message: `api_key mode, mcp_url=${remote.mcp_url}`,
+    });
+  } else if (!issuerOk) {
     checks.push({
       name: 'config_integrity',
       status: 'fail',
@@ -117,6 +135,51 @@ export async function collectRemoteDoctorReport(
       message: `mcp_url=${remote.mcp_url}, issuer_url=${remote.issuer_url}`,
     });
   }
+
+  // ── API key mode: simplified path, skip OAuth ──
+  if (apiKeyMode) {
+    const apiKey = process.env.GBRAIN_API_KEY ?? remote.api_key;
+    if (!apiKey) {
+      checks.push({
+        name: 'api_key_auth',
+        status: 'fail',
+        message: 'API key mode active but no key found. Set GBRAIN_API_KEY or remote_mcp.api_key.',
+      });
+      return finalize(remote, checks, undefined, 'api_key');
+    }
+    checks.push({
+      name: 'api_key_auth',
+      status: 'ok',
+      message: 'API key mode — using key directly (no OAuth discovery/token exchange)',
+    });
+
+    // MCP smoke with API key
+    const mcpRes = await smokeTestMcp(remote.mcp_url, apiKey);
+    if (!mcpRes.ok) {
+      checks.push({
+        name: 'mcp_smoke',
+        status: 'fail',
+        message: mcpRes.message,
+        detail: { reason: mcpRes.reason, ...(mcpRes.status ? { status: mcpRes.status } : {}) },
+      });
+      return finalize(remote, checks, undefined, 'api_key');
+    }
+    checks.push({
+      name: 'mcp_smoke',
+      status: 'ok',
+      message: 'initialize round-trip succeeded (API key)',
+    });
+
+    // Skip scope probe — API keys are full-access (no OAuth scopes).
+    // Skip upgrade-drift check unless the mcp_smoke passed AND we can probe.
+    if (!skipProbe) {
+      checks.push(await runOrphanRatioCheck(config));
+      checks.push(await runUpgradeDriftCheck(config));
+    }
+
+    return finalize(remote, checks, undefined, 'api_key');
+  }
+  // ── OAuth mode below ──
 
   // Resolve the secret: env var wins, then config file value.
   const clientSecret = process.env.GBRAIN_REMOTE_CLIENT_SECRET ?? remote.oauth_client_secret;
@@ -135,6 +198,7 @@ export async function collectRemoteDoctorReport(
     return {
       schema_version: 2,
       mode: 'thin-client',
+      auth_mode: 'oauth',
       status: 'fail',
       mcp_url: remote.mcp_url,
       issuer_url: remote.issuer_url,
@@ -214,7 +278,6 @@ export async function collectRemoteDoctorReport(
   // SDK Client hangs on JSON-RPC shape mismatch in fixtures that don't
   // implement full tools/call.
   const grantedScope = tokenRes.token.scope ?? '';
-  const skipProbe = opts.skipScopeProbe || process.env.GBRAIN_DOCTOR_SKIP_SCOPE_PROBE === '1';
   if (!skipProbe) {
     const scopeResult = await probeScopes(config);
     checks.push(buildScopeCheck(grantedScope, scopeResult));
@@ -529,6 +592,7 @@ function finalize(
   remote: NonNullable<GBrainConfig['remote_mcp']>,
   checks: RemoteCheck[],
   scope?: string,
+  authMode: 'api_key' | 'oauth' = 'oauth',
 ): RemoteDoctorReport {
   const status: 'ok' | 'warn' | 'fail' = checks.some(c => c.status === 'fail')
     ? 'fail'
@@ -538,6 +602,7 @@ function finalize(
   return {
     schema_version: 2,
     mode: 'thin-client',
+    auth_mode: authMode,
     status,
     mcp_url: remote.mcp_url,
     issuer_url: remote.issuer_url,
@@ -551,9 +616,12 @@ function printHumanReport(report: RemoteDoctorReport): void {
   console.log('\nGBrain Health Check (thin-client)');
   console.log('=================================');
   console.log(`Mode:        ${report.mode}`);
-  console.log(`Issuer URL:  ${report.issuer_url}`);
+  console.log(`Auth:        ${report.auth_mode === 'api_key' ? 'API key' : 'OAuth 2.1'}`);
   console.log(`MCP URL:     ${report.mcp_url}`);
-  console.log(`Client ID:   ${report.oauth_client_id}`);
+  if (report.auth_mode === 'oauth') {
+    console.log(`Issuer URL:  ${report.issuer_url}`);
+    console.log(`Client ID:   ${report.oauth_client_id}`);
+  }
   if (report.oauth_scope) console.log(`OAuth scope: ${report.oauth_scope}`);
   console.log('');
 
@@ -571,7 +639,12 @@ function printHumanReport(report: RemoteDoctorReport): void {
     console.log('Connectivity check FAILED — see error above.');
     console.log('Common fixes:');
     console.log('  - Confirm the host is reachable + `gbrain serve --http` is running.');
-    console.log('  - Confirm OAuth credentials are valid (have the host operator re-mint via `gbrain auth register-client`).');
+    if (report.auth_mode === 'api_key') {
+      console.log('  - Verify your API key is valid: gbrain auth list (on the host).');
+      console.log('  - Create or re-create: gbrain auth create <name> (on the host).');
+    } else {
+      console.log('  - Confirm OAuth credentials are valid (have the host operator re-mint via `gbrain auth register-client`).');
+    }
     console.log('  - Confirm `mcp_url` matches the path the host serves /mcp on (default: <issuer_url>/mcp).');
   }
 }
